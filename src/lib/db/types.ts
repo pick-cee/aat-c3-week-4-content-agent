@@ -82,11 +82,18 @@ export type PublishStatus =
   | "published_dry_run"
   | "cancelled";
 
+/**
+ *  is the state for a delivery whose provider never responded. It
+ * is NOT : a failed send can be retried safely, and an unknown one
+ * cannot — re-sending it is how a recipient gets the same message twice
+ * (rule 9b, §15.5).
+ */
 export type DeliveryStatus =
   | "pending"
   | "sent"
   | "delivered"
   | "failed"
+  | "uncertain"
   | "skipped_no_optin";
 
 export type ConnectorKind = "delivering" | "handoff";

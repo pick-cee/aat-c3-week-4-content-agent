@@ -10,12 +10,13 @@
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
     "db:push": "tsx scripts/db-push.ts",
-    "db:seed": "tsx scripts/seed.ts",
+    "db:seed": "tsx --require ./scripts/stub-server-only.cjs scripts/seed.ts",
     "test": "vitest run",
     "test:watch": "vitest",
     "broken-pack": "tsx --require ./scripts/stub-server-only.cjs scripts/broken-input-pack.ts",
     "verify:selects": "tsx scripts/verify-selects.ts",
-    "verify:schemas": "tsx --require ./scripts/stub-server-only.cjs scripts/verify-schemas.ts"
+    "verify:schemas": "tsx --require ./scripts/stub-server-only.cjs scripts/verify-schemas.ts",
+    "verify:grants": "tsx scripts/verify-grants.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.125.0",

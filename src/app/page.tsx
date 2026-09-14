@@ -9,6 +9,7 @@ import {
 } from "@/components/status";
 import { Landing } from "@/components/landing";
 import { DeleteRequest } from "@/components/delete-request";
+import { UncertainDeliveries } from "@/components/uncertain-deliveries";
 import type { ContentRequest } from "@/lib/db/types";
 
 /**
@@ -89,6 +90,8 @@ export default async function Dashboard({
           <div className="tile-label">Spent this month</div>
         </div>
       </div>
+
+      <UncertainDeliveries />
 
       {attention.length > 0 && (
         <div className="card mb-3" style={{ borderColor: "#fecaca" }}>

@@ -1115,6 +1115,27 @@ message id. Found means the row resolves. Not found means it is offered to a
 human with **It sent / It did not** and the actual content, and only a person
 moves it.
 
+**This applies per recipient, not only per queue row.** The sweep originally
+marked a stuck delivery `failed`, and the worker re-sends anything that is not
+`sent` or `delivered` — so a delivery that timed out, and may well have
+arrived, was re-sent and that subscriber received the newsletter twice. That is
+the exact failure rule 9b exists to prevent, and it contradicted the paragraph
+above it.
+
+`publish_deliveries.status` therefore has its own `uncertain` value, distinct
+from `failed`:
+
+| Status      | Means                                      | Retried? |
+| ----------- | ------------------------------------------ | -------- |
+| `failed`    | The provider refused it. It did not go.    | Yes — safe, we know the outcome |
+| `uncertain` | The provider never responded.              | **No** — it may already have arrived |
+
+An `uncertain` delivery is counted separately in the roll-up, so a queue row is
+never called `partially_delivered` on the strength of sends nobody can account
+for. The message says what is true: "37 of 40 delivered, 2 failed, 1 unknown".
+Those rows surface in the dashboard and the queue with the recipient and the
+provider message id, which is what a person needs to resolve one by hand.
+
 | Channel     | Read-back                                       | Consequence                                                       |
 | ----------- | ----------------------------------------------- | ----------------------------------------------------------------- |
 | WhatsApp    | Message status by id, plus delivery webhooks    | Reconciles automatically                                          |
@@ -1335,6 +1356,32 @@ tokens each. Adding WhatsApp cost roughly a third of a cent.
    the article permalink in §10.1, served by a route that selects an explicit
    column list — never `select *`, which is how an internal note or a token
    column ends up on a public page after a later migration.
+
+4b. **RLS is not the only boundary: EXECUTE is one too.** Postgres grants
+   EXECUTE to PUBLIC by default on every function it creates, so an explicit
+   `grant execute … to service_role` *adds* a grant without removing the
+   default. The `public.*` RPC wrappers delegate to SECURITY DEFINER functions
+   that bypass RLS, and PostgREST serves `public` — so for a period, anyone
+   holding the anon key that ships in the browser bundle could call them.
+
+   Verified against the live project before it was fixed:
+   `claim_due_publish_item` returned HTTP 200 to the anon key, letting a
+   stranger drag every scheduled item into `publishing` where the watchdog then
+   marks it `uncertain` and it stops going out; `bump_counter` let them exhaust
+   the rate limits; `add_request_cost` let them push live requests into
+   `budget_exceeded`. All three now return 401.
+
+   Migration 0007 revokes EXECUTE from `public`, `anon` and `authenticated` in
+   both schemas, sets `alter default privileges … revoke execute` so a function
+   added later is not silently open, and re-grants only what is named:
+   everything to `service_role`, `read_counter` and `dashboard_counts` to
+   `authenticated`, and the three RLS helper predicates to `anon` because the
+   policies in §19.4 call them as the querying role.
+
+   `npm run verify:grants` is a standing check, not a one-time audit — the
+   default privilege is what caused this, so the only durable fix is one that
+   fails the build when it recurs.
+
 5. **Cron is authenticated** with a shared secret compared in constant time.
    An unauthenticated publish endpoint is a stranger's message to your audience.
    The WhatsApp webhook verifies Meta's signature on every call, and the handoff

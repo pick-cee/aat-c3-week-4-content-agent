@@ -9,6 +9,7 @@ import {
   formatWhen,
 } from "@/components/status";
 import { QueueActions } from "@/components/queue-actions";
+import { UncertainDeliveries } from "@/components/uncertain-deliveries";
 import type {
   ConnectorStatusRow,
   PublishDelivery,
@@ -86,6 +87,8 @@ export default async function QueuePage() {
           <p>What is scheduled, what went out, and what did not.</p>
         </div>
       </div>
+
+      <UncertainDeliveries />
 
       {/* Connector status banners at the top (§16). A channel with no
           authorised connector is honest about it rather than failing later. */}

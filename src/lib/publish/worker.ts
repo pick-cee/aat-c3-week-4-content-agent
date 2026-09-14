@@ -5,6 +5,7 @@ import { sendEmail, getEmailStatus } from "@/lib/providers/resend";
 import { notifyPublishProblem, sendHandoffPacket } from "@/lib/notify";
 import { signHandoffToken } from "@/lib/crypto";
 import { renderNewsletterHtml } from "./render";
+import { rollUpDeliveries, isAlreadyHandled } from "./rollup";
 import { env } from "@/lib/env";
 import {
   PUBLISH_BATCH_SIZE,
@@ -279,20 +280,26 @@ async function deliverFanOut(
     .select("recipient_id, status")
     .eq("queue_id", item.id);
 
-  const alreadyDone = new Set(
+  // `uncertain` counts as handled: the provider never told us whether it
+  // arrived, so re-sending could deliver it twice (rule 9b, §15.5).
+  const alreadyHandled = new Map(
     (existingRows ?? [])
-      .filter((r) => r.status === "sent" || r.status === "delivered")
-      .map((r) => r.recipient_id as string),
+      .filter((r) => isAlreadyHandled(r.status as string))
+      .map((r) => [r.recipient_id as string, r.status as string]),
   );
 
   let sent = 0;
   let failed = 0;
+  let uncertain = 0;
   let skipped = 0;
 
   for (const recipient of recipients) {
-    // Never re-send to someone already served. This is the whole point.
-    if (alreadyDone.has(recipient.id)) {
-      sent++;
+    // Never re-send to someone already served, or someone whose outcome we
+    // cannot account for. This is the whole point.
+    const handled = alreadyHandled.get(recipient.id);
+    if (handled) {
+      if (handled === "uncertain") uncertain++;
+      else sent++;
       continue;
     }
 
@@ -332,53 +339,39 @@ async function deliverFanOut(
     else failed++;
   }
 
-  const attempted = sent + failed;
+  // §15.3 step 4. The counts are shown, never a status word alone (§5.12).
   const isDryRun = env.app.demoMode;
+  const outcome = rollUpDeliveries({ sent, failed, uncertain, skipped }, isDryRun);
 
-  // §15.3 step 4, and the count is shown, never a status word alone.
-  if (attempted === 0) {
-    await setStatus(item, "failed", {
-      status: "failed",
-      last_error: `Every recipient was skipped: ${skipped} are not opted in.`,
-    });
-    return { status: "failed", message: `All ${skipped} recipients skipped.` };
-  }
+  const succeeded =
+    outcome.status === "published" || outcome.status === "published_dry_run";
 
-  if (failed === 0) {
-    // A DEMO_MODE send is stored as a dry run, a distinct value (§19.6).
-    const status = isDryRun ? "published_dry_run" : "published";
-    await setStatus(item, status, {
-      status,
-      platform_post_id: `batch:${item.id}`,
-      published_at: new Date().toISOString(),
-      last_error: null,
-    });
-    await logInfo(
-      `${item.channel}: delivered to ${sent} of ${recipients.length}` +
-        (skipped > 0 ? `, ${skipped} skipped for consent` : "") +
-        (isDryRun ? " (dry run)" : "") +
-        ".",
-      { queueId: item.id, requestId: item.request_id },
-    );
-    return { status, message: `${sent} delivered${isDryRun ? " (dry run)" : ""}.` };
-  }
-
-  // Neither published nor failed, and calling it either would be a lie (§5.12).
-  await setStatus(item, "partially_delivered", {
-    status: "partially_delivered",
-    last_error: `${sent} of ${attempted} delivered; ${failed} failed.`,
+  await setStatus(item, outcome.status, {
+    status: outcome.status,
+    ...(succeeded
+      ? {
+          platform_post_id: `batch:${item.id}`,
+          published_at: new Date().toISOString(),
+          last_error: null,
+        }
+      : { last_error: outcome.message }),
   });
 
-  await notifyPublishProblem(
-    item.id,
-    "partial",
-    `${sent} of ${attempted} delivered. ${failed} failed. Retrying sends only to the ones that failed.`,
-  );
+  if (succeeded) {
+    await logInfo(`${item.channel}: ${outcome.message}`, {
+      queueId: item.id,
+      requestId: item.request_id,
+    });
+  } else {
+    await logWarn(`${item.channel}: ${outcome.message}`, {
+      queueId: item.id,
+      requestId: item.request_id,
+      detail: { sent, failed, uncertain, skipped },
+    });
+    await notifyPublishProblem(item.id, uncertain > 0 ? "uncertain" : "partial", outcome.message);
+  }
 
-  return {
-    status: "partially_delivered",
-    message: `${sent} of ${attempted} delivered, ${failed} failed.`,
-  };
+  return { status: outcome.status, message: outcome.message };
 }
 
 async function upsertDelivery(

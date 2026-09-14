@@ -30,6 +30,8 @@ import {
   segmentSentencesWithMarkers,
   type LabelledExcerpt,
 } from "../src/lib/pipeline/grounding";
+import { rollUpDeliveries, isAlreadyHandled } from "../src/lib/publish/rollup";
+import { checkGrants } from "./verify-grants";
 import {
   checkLinkedIn,
   checkNewsletter,
@@ -263,6 +265,58 @@ check(
 );
 check("An unparseable number returns null, not a guess", normaliseE164("not a phone") === null);
 
+// ─── Fan-out roll-up ────────────────────────────────────────────────────────
+
+section("Broadcasts: a status must not claim to know more than it does");
+
+{
+  const tally = (over: Partial<{ sent: number; failed: number; uncertain: number; skipped: number }> = {}) => ({
+    sent: 0, failed: 0, uncertain: 0, skipped: 0, ...over,
+  });
+
+  // "The same broadcast retried after a partial failure → nobody receives it
+  // twice." A timed-out delivery used to be recorded as `failed`, so the retry
+  // re-sent it.
+  check(
+    "A delivery with an unknown outcome is not re-sent",
+    isAlreadyHandled("uncertain") && !isAlreadyHandled("failed"),
+    "uncertain must be skipped on retry; failed is safe to re-send",
+  );
+
+  const mixed = rollUpDeliveries(tally({ sent: 37, failed: 2, uncertain: 1 }), false);
+  check(
+    "A mix of sent, failed and unknown reports all three",
+    mixed.message.includes("37 of 40 delivered") &&
+      mixed.message.includes("2 failed") &&
+      mixed.message.includes("1 unknown"),
+    mixed.message,
+  );
+  check(
+    "An unknown delivery is not counted as a failure",
+    !/3 failed/.test(mixed.message),
+    mixed.message,
+  );
+
+  const unknownOnly = rollUpDeliveries(tally({ sent: 39, uncertain: 1 }), false);
+  check(
+    "A broadcast with an unaccounted-for send never reads as published",
+    unknownOnly.status !== "published" && unknownOnly.status !== "published_dry_run",
+    `got ${unknownOnly.status}`,
+  );
+
+  check(
+    "A skipped recipient is counted, not silently dropped",
+    rollUpDeliveries(tally({ sent: 37, skipped: 3 }), false).message.includes(
+      "3 skipped for consent",
+    ),
+  );
+
+  check(
+    "A DEMO_MODE send is a dry run, never a real publish",
+    rollUpDeliveries(tally({ sent: 3 }), true).status === "published_dry_run",
+  );
+}
+
 // ─── Diagnostics ────────────────────────────────────────────────────────────
 
 section("Diagnostics: printing the bytes when something behaves impossibly");
@@ -270,6 +324,45 @@ section("Diagnostics: printing the bytes when something behaves impossibly");
 check("A non-breaking space is made visible", describeBytes("a b") === "a[NBSP]b");
 check("A zero-width space is made visible", describeBytes("a​b") === "a[U+200B]b");
 check("A newline is made visible", describeBytes("a\nb") === "a\\nb");
+
+// ─── Function grants ────────────────────────────────────────────────────────
+
+async function checkFunctionGrants() {
+  section("Security: who can execute the pipeline's functions");
+
+  /**
+   * Runs the standing grant check as part of the pack, so an over-granted
+   * function shows up in the evidence table rather than only in a script
+   * somebody has to remember to run.
+   *
+   * Skipped rather than failed without a database URL: the pack must stay
+   * runnable offline, and a missing connection string is not a security
+   * finding.
+   */
+  if (!process.env.SUPABASE_DB_URL) {
+    console.log("  skip  no SUPABASE_DB_URL, so grants could not be checked");
+  } else {
+    // Run in-process rather than shelling out: spawning npx fails on Windows
+    // with EINVAL, and a check that cannot run on the machine doing the
+    // testing is not a check.
+    try {
+      const { problems, functionCount } = await checkGrants();
+      check(
+        "No function is executable by public, anon or an unexpected role",
+        problems.length === 0,
+        problems.length > 0
+          ? `${problems.length} of ${functionCount}: ${problems[0]}`
+          : "",
+      );
+    } catch (err) {
+      check(
+        "No function is executable by public, anon or an unexpected role",
+        false,
+        `the check could not run: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+}
 
 // ─── What needs a live run ──────────────────────────────────────────────────
 
@@ -307,12 +400,24 @@ reconstructed afterwards.
       URL and creates no second record
 `);
 
-// ─── Result ─────────────────────────────────────────────────────────────────
+/**
+ * The grant check needs a database, so the summary waits for it. Everything
+ * above is synchronous and has already printed.
+ */
+checkFunctionGrants()
+  .catch((err) => {
+    check(
+      "No function is executable by public, anon or an unexpected role",
+      false,
+      `the check could not run: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  })
+  .finally(() => {
+    console.log(`\n${"─".repeat(60)}`);
+    console.log(`${passed} passed, ${failed} failed`);
 
-console.log("─".repeat(60));
-console.log(`${passed} passed, ${failed} failed`);
-
-if (failed > 0) {
-  console.log("\nSomething the spec says must be caught is not being caught.");
-  process.exit(1);
-}
+    if (failed > 0) {
+      console.log("\nSomething the spec says must be caught is not being caught.");
+      process.exit(1);
+    }
+  });

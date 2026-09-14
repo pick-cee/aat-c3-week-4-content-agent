@@ -11,11 +11,15 @@ An AI content research and publishing agent for a marketing agency. A content
 manager submits an idea or a URL. The system researches it, stores what it read,
 proposes angles, drafts an SEO article grounded in stored excerpts, grades the
 draft against a rubric, revises what fails, adapts the approved article for
-LinkedIn, X, an email newsletter and a WhatsApp broadcast, and — after a human
-approves — releases it on a schedule.
+LinkedIn, X and an email newsletter, and — after a human approves — releases it
+on a schedule.
+
+> **Three channels, not four.** DESIGN.md §2.12 proposed WhatsApp as a fourth.
+> It was dropped. The code and schema are the authority here; where this
+> document or DESIGN.md still describes a WhatsApp broadcast, the code is right.
 
 **Two kinds of channel, and the distinction matters everywhere.** The newsletter
-and WhatsApp are _delivering_: the system sends them itself. LinkedIn and X are
+is _delivering_: the system sends it itself. LinkedIn and X are
 _handoff_: their content is generated, format-checked, approved and scheduled
 exactly like the others, but at the scheduled moment the system dispatches a
 copy-ready packet to the person who posts it, and that person confirms with a
@@ -31,8 +35,7 @@ secrets. Working on the happy path is the baseline, not the goal.
 ## Stack
 
 Next.js (App Router) on Vercel · Supabase Postgres with pgvector · Anthropic API ·
-Firecrawl · Voyage AI embeddings · Resend · WhatsApp Business Cloud API.
-TypeScript throughout.
+Firecrawl · Voyage AI embeddings · Resend. TypeScript throughout.
 
 ## Rules that are not negotiable
 
@@ -105,8 +108,17 @@ failure this whole build exists to avoid.
 
 9b. **Fan-out is idempotent per recipient, not per queue row.** `publish_deliveries`
 is the record; a retry after a partial failure re-sends only to rows that are
-not yet `sent`. Nobody receives the same broadcast twice — on WhatsApp that is
-the most visible mistake this system could make.
+not yet `sent`, `delivered` **or `uncertain`**. Nobody receives the same
+broadcast twice — sending a newsletter to the same subscriber twice is the most
+visible mistake this system could make.
+
+The `uncertain` half of that is the one that was wrong. A delivery whose
+provider never responded used to be recorded as `failed`, and the retry
+re-sent it. A failed send is safe to retry because the provider told us it did
+not go; an unknown one is not, for exactly the reason §15.5 gives about queue
+rows. The two cases are now distinct values, counted separately, and a
+broadcast that includes one reads "37 of 40 delivered, 2 failed, 1 unknown"
+rather than folding the unknown into either column.
 
 9c. **Never message anyone without a consent record.** Opt-in is checked in the
 send path, not only at import. Opt-out is immediate and permanent. A skipped
@@ -125,6 +137,22 @@ screenshot or the video.
     naming the step, a plain-language reason, a structured detail, an
     `activity_log` row, and an email to the request's creator when terminal. A
     retry button appears only where retrying could actually help.
+
+11b. **A `grant` is not a boundary until the default is revoked.** Postgres
+    grants EXECUTE to PUBLIC on every function it creates. Adding
+    `grant execute … to service_role` therefore *adds* a grant without removing
+    the default one — and because the `public.*` wrappers delegate to SECURITY
+    DEFINER functions that bypass RLS, anyone holding the anon key that ships in
+    the browser bundle could call them. Verified live: `claim_due_publish_item`
+    returned HTTP 200 to the anon key, and `bump_counter` let a stranger burn
+    the rate limits.
+
+    Every new function needs an explicit REVOKE, and
+    `alter default privileges … revoke execute` must cover the schema so the
+    next one is not silently open. `npm run verify:grants` fails the build if
+    anything is executable by `public`, `anon`, or by `authenticated` beyond the
+    two named reads. The check is standing, not a one-time audit, because the
+    default privilege is what caused this.
 
 12. **Secrets are server-side only.** Anthropic, Firecrawl, Voyage, Resend,
     Supabase service role, LinkedIn and X credentials never reach the browser.

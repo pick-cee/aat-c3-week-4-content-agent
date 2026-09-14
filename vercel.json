@@ -1,0 +1,14 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "//": "A five-minute cadence needs a paid Vercel plan; the free plan allows one run a day, which is too coarse to show a scheduled post going out. On the free plan, remove this block and point an external scheduler (cron-job.org, GitHub Actions) at /api/cron/release with `Authorization: Bearer $CRON_SECRET` instead. DESIGN.md §23.1.",
+  "crons": [
+    {
+      "path": "/api/cron/release",
+      "schedule": "*/5 * * * *"
+    }
+  ],
+  "functions": {
+    "src/app/api/runner/route.ts": { "maxDuration": 60 },
+    "src/app/api/cron/release/route.ts": { "maxDuration": 60 }
+  }
+}

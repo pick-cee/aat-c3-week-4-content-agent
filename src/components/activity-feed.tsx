@@ -1,0 +1,78 @@
+import { Ago } from "./status";
+import type { ActivityLogEntry } from "@/lib/db/types";
+
+/**
+ * The activity log. DESIGN.md §5.15.
+ *
+ * "Every state transition writes a row. Every failure writes a row with a
+ * plain-language message a non-engineer can read and a detail an engineer can
+ * debug from."
+ *
+ * Both audiences are served here: the message is always visible, the detail
+ * is behind a disclosure.
+ */
+
+export function ActivityFeed({ entries }: { entries: ActivityLogEntry[] }) {
+  if (entries.length === 0) return null;
+
+  return (
+    <details className="card mt-3">
+      <summary
+        className="card-head"
+        style={{ cursor: "pointer", listStyle: "none", borderBottom: "none" }}
+      >
+        <h2 style={{ fontSize: 14 }}>Activity</h2>
+        <span className="tiny dim">{entries.length} entries</span>
+      </summary>
+
+      <div style={{ borderTop: "1px solid var(--border)" }}>
+        {entries.map((entry) => (
+          <div
+            key={entry.id}
+            style={{
+              padding: "9px 20px",
+              borderBottom: "1px solid var(--border)",
+              display: "flex",
+              gap: 12,
+              alignItems: "flex-start",
+            }}
+          >
+            <span
+              className="dot"
+              style={{
+                marginTop: 7,
+                flex: "none",
+                background:
+                  entry.level === "error"
+                    ? "var(--danger)"
+                    : entry.level === "warn"
+                      ? "var(--warn)"
+                      : "var(--border-strong)",
+              }}
+            />
+            <div className="grow" style={{ minWidth: 0 }}>
+              <div className="small">{entry.message}</div>
+              {entry.detail && (
+                <details>
+                  <summary className="tiny dim" style={{ cursor: "pointer" }}>
+                    detail
+                  </summary>
+                  <pre
+                    className="preview tiny mono mt-1"
+                    style={{ overflow: "auto", maxHeight: 200 }}
+                  >
+                    {JSON.stringify(entry.detail, null, 2)}
+                  </pre>
+                </details>
+              )}
+            </div>
+            <span className="nowrap" style={{ flex: "none" }}>
+              {entry.step && <span className="tiny dim">{entry.step} · </span>}
+              <Ago iso={entry.created_at} />
+            </span>
+          </div>
+        ))}
+      </div>
+    </details>
+  );
+}

@@ -54,9 +54,9 @@ export async function GET() {
     integrations.firecrawl,
     "Key present. Every source URL is read through it.",
   );
-  checks.voyage = await probe(
-    integrations.voyage,
-    "Key present. Grounding checks depend on it.",
+  checks.embeddings = await probe(
+    integrations.embeddings,
+    "Key present. Grounding checks and source ranking depend on it.",
   );
   checks.resend = await probe(
     integrations.resend,

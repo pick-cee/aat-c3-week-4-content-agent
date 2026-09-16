@@ -1,6 +1,6 @@
 import "server-only";
 import { segmentSentences, stripMarkdown, type Sentence } from "@/lib/text";
-import { embed, cosineSimilarity, parseVector } from "@/lib/providers/voyage";
+import { embed, cosineSimilarity, parseVector } from "@/lib/providers/embeddings";
 import {
   GROUNDING_STRONG_THRESHOLD,
   GROUNDING_WEAK_THRESHOLD,
@@ -56,6 +56,8 @@ export function renderExcerptsForPrompt(excerpts: LabelledExcerpt[]): string {
   return excerpts
     .map((e) => {
       const meta = [e.siteName, e.publishedAt?.slice(0, 10)].filter(Boolean).join(", ");
+      // A field separator in the prompt's own structure, not prose a person
+      // reads, so the em dash rule does not apply here.
       const header = `[${e.label}] source ${e.sourceLabel} — "${e.sourceTitle ?? "Untitled"}"${
         meta ? ` (${meta})` : ""
       }`;
@@ -237,7 +239,7 @@ export function runTripwire(
   const haystack = knownText.join("\n").toLowerCase();
   const hits: TripwireHit[] = [];
 
-  segmentSentencesWithMarkers(stripMarkdownKeepingMarkers(body)).forEach((sentence) => {
+  segmentSentencesWithMarkers(stripMarkdownKeepingMarkers(proseOnly(body))).forEach((sentence) => {
     // Only unmarked sentences are candidates — a marked one is the vector
     // check's business, not the tripwire's.
     if (extractMarkers(sentence.text).length > 0) return;
@@ -290,6 +292,38 @@ function isHarmlessNumber(sentence: string): boolean {
  * and the claim map comes back empty. Placeholders survive the strip and are
  * restored afterwards.
  */
+/**
+ * Drops the lines that are structure rather than prose.
+ *
+ * A heading cannot carry a citation, and neither can a table row: a marker on
+ * an H2 would render inside the heading. The tripwire scanned them anyway and
+ * flagged each as an uncited claim:
+ *
+ *   "How to Run Structured Interviews: The Four-Step Process That Matters"
+ *   "Score Rating Behavioral Indicators"
+ *   "3 Adequate Relevant example, but lacking detail or measurable outcomes."
+ *
+ * Three of the four flags that sent one request to `needs_human` were these.
+ * No revision could clear them, because nothing was wrong.
+ */
+function proseOnly(markdown: string): string {
+  return markdown
+    // A link marker names the excerpt its URL comes from, so a sentence
+    // carrying one IS attributed. Left in place it reads as bare prose that
+    // happens to mention a source, and the tripwire flags it as uncited.
+    .replace(/\(\(link:[^|)]*\|\s*(E\d+)\s*\)\)/g, "[$1]")
+    .replace(/\(\(link:[^)]*\)\)/g, " ")
+    .split("\n")
+    .filter((line) => {
+      const t = line.trim();
+      if (t.startsWith("#")) return false;
+      // A table row, and the |---|---| rule beneath its header.
+      if (t.startsWith("|")) return false;
+      return true;
+    })
+    .join("\n");
+}
+
 function stripMarkdownKeepingMarkers(markdown: string): string {
   const held: string[] = [];
 

@@ -8,6 +8,8 @@ import {
   FETCH_RETRY_ATTEMPTS,
   FETCH_RETRY_BASE_MS,
   PAYWALL_MARKERS,
+  NOT_AN_ARTICLE_MARKERS,
+  NOT_AN_ARTICLE_MAX_CHARS,
 } from "@/lib/constants";
 import { registrableDomain } from "@/lib/text";
 import type { FetchStatus } from "@/lib/db/types";
@@ -240,6 +242,34 @@ export async function scrape(url: string): Promise<ScrapeResult> {
     };
   }
 
+  /**
+   * Fetched, plenty of text, but not an article.
+   *
+   * A GitLab sign-in page passed every check above — it is not empty, not a
+   * paywall, and returns 200 — so it entered the corpus as a usable source.
+   * That left one real article standing behind two "sources", which made the
+   * two-sources-per-angle rule unsatisfiable and cost three planning attempts.
+   *
+   * Reported as `empty` rather than a new status: from the reviewer's point of
+   * view it is the same fact — the page was read and had no article on it.
+   */
+  const firstLines = markdown.slice(0, 1_500).toLowerCase();
+  if (
+    markdown.length < NOT_AN_ARTICLE_MAX_CHARS &&
+    NOT_AN_ARTICLE_MARKERS.some((marker) => firstLines.includes(marker))
+  ) {
+    return {
+      ...enriched,
+      markdown: markdown || null,
+      markdownChars: markdown.length,
+      status: "empty",
+      error:
+        "The page was fetched but is not an article, it looks like a sign-in page, " +
+        "a consent screen or a placeholder.",
+      retryable: false,
+    };
+  }
+
   // Fetched, but nothing there. DISTINCT from fetch_failed: this page exists
   // and we read it; it is a nav shell or a stub (§5.4, §21.1).
   if (markdown.trim().length < MIN_MARKDOWN_CHARS) {
@@ -304,9 +334,9 @@ export function describeFetchStatus(status: FetchStatus): string {
     case "blocked": return "Blocked by the site";
     case "paywalled": return "Behind a paywall";
     case "empty": return "Fetched, but had no article text";
-    case "too_large": return "Very long — truncated, still used";
+    case "too_large": return "Very long, truncated, still used";
     case "unsupported_type": return "Not a readable document";
-    case "redirected_offsite": return "Redirected to another site — still used";
+    case "redirected_offsite": return "Redirected to another site, still used";
   }
 }
 

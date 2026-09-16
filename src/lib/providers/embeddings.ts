@@ -9,19 +9,27 @@ import {
 import { estimateTokens } from "@/lib/text";
 
 /**
- * Voyage embeddings.
+ * Embeddings, via OpenAI.
  *
  * DESIGN.md §2.5 is explicit that vectors earn their place here for two
  * reasons, and the second is the real one: they cut what goes into the
  * drafting call (cost), and they let us check whether a sentence actually
  * relates to the excerpt it cites (grounding, §8.4).
  *
- * `input_type` matters and is not cosmetic — documents and queries are
- * embedded into deliberately different regions of the space, so a document
- * embedded as a query scores badly against its own text.
+ * WAS Voyage. Voyage's free tier allows only a few requests a minute, and the
+ * failure mode was not a clean error: six fetched articles of 20k-36k
+ * characters were refused, dropped from the corpus, and the symptom surfaced
+ * three steps later as "these three angles are too similar". The provider
+ * changed; nothing about the grounding contract did.
+ *
+ * `input_type` is kept in the signature even though OpenAI has no such
+ * parameter. Voyage embedded documents and queries into deliberately different
+ * regions of the space, so the distinction was load-bearing there; here it is
+ * inert, and keeping it means the call sites still read correctly and a move
+ * back to an asymmetric model is a one-file change.
  */
 
-const API_URL = "https://api.voyageai.com/v1/embeddings";
+const API_URL = "https://api.openai.com/v1/embeddings";
 
 export type InputType = "document" | "query";
 
@@ -36,9 +44,9 @@ export class EmbeddingError extends Error {
   }
 }
 
-interface VoyageResponse {
+interface EmbeddingResponse {
   data: { embedding: number[]; index: number }[];
-  usage: { total_tokens: number };
+  usage: { total_tokens: number; prompt_tokens?: number };
 }
 
 export interface EmbedResult {
@@ -64,7 +72,7 @@ export async function embed(
 
   for (let i = 0; i < texts.length; i += EMBEDDING_BATCH_SIZE) {
     const batch = texts.slice(i, i + EMBEDDING_BATCH_SIZE);
-    const result = await embedBatch(batch, inputType);
+    const result = await embedBatch(batch);
 
     // The API returns an `index` per item; sorting by it rather than trusting
     // array order is cheap insurance on the one thing that would fail silently.
@@ -107,26 +115,43 @@ export async function embedOne(
   return first;
 }
 
-async function embedBatch(texts: string[], inputType: InputType): Promise<VoyageResponse> {
-  // One retry, per §7.4. A source whose chunks could not be embedded is marked
-  // and excluded from vector selection but remains available for manual
-  // inclusion — it is never silently dropped.
+async function embedBatch(texts: string[]): Promise<EmbeddingResponse> {
+  // Per §7.4, a source whose chunks could not be embedded is marked and
+  // excluded from vector selection but remains available for manual inclusion —
+  // it is never silently dropped.
   let lastError: unknown;
 
-  for (let attempt = 0; attempt <= 1; attempt++) {
+  /**
+   * Several attempts with a long backoff, because a rate limit is PER MINUTE.
+   *
+   * Kept after the move off Voyage even though OpenAI's paid limits are far
+   * higher and this should now be dead code in practice. It is cheap, and the
+   * failure it defends against was expensive: batches refused with 429, six
+   * good articles dropped from the corpus, and a symptom that surfaced three
+   * steps away as "three angles are too similar".
+   *
+   * One retry a second later cannot clear a per-minute window. Waiting does.
+   */
+  for (let attempt = 0; attempt <= EMBED_RETRY_ATTEMPTS; attempt++) {
     try {
+      await paceRequest();
+
       const response = await fetch(API_URL, {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${env.voyage.apiKey}`,
+          Authorization: `Bearer ${env.embeddings.apiKey}`,
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
-          input: texts,
+          // Voyage truncated oversize input on request; OpenAI returns a 400
+          // instead, so the clamp happens here. A chunk long enough to hit this
+          // is already far past the chunker's target size (§5.5).
+          input: texts.map(clampToTokenLimit),
           model: EMBEDDING_MODEL,
-          input_type: inputType,
-          output_dimension: EMBEDDING_DIMENSIONS,
-          truncation: true,
+          // Native 1536 dims, shortened to 512. Not a truncation of a larger
+          // vector: the model is trained so a shortened vector stays usable,
+          // and the pgvector column is declared at 512.
+          dimensions: EMBEDDING_DIMENSIONS,
         }),
         signal: AbortSignal.timeout(60_000),
       });
@@ -139,18 +164,18 @@ async function embedBatch(texts: string[], inputType: InputType): Promise<Voyage
           response.status,
           retryable,
         );
-        if (!retryable || attempt === 1) throw error;
+        if (!retryable || attempt === EMBED_RETRY_ATTEMPTS) throw error;
         lastError = error;
-        await sleep(1_000 * (attempt + 1) + Math.random() * 500);
+        await sleep(backoffMs(attempt, response.status));
         continue;
       }
 
-      return (await response.json()) as VoyageResponse;
+      return (await response.json()) as EmbeddingResponse;
     } catch (err) {
       if (err instanceof EmbeddingError && !err.retryable) throw err;
-      if (attempt === 1) throw err;
+      if (attempt === EMBED_RETRY_ATTEMPTS) throw err;
       lastError = err;
-      await sleep(1_000 + Math.random() * 500);
+      await sleep(backoffMs(attempt));
     }
   }
 
@@ -161,6 +186,62 @@ async function embedBatch(texts: string[], inputType: InputType): Promise<Voyage
 
 function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * OpenAI rejects an input over 8,192 tokens with a 400 rather than truncating,
+ * and a 400 is not retryable — so one oversized chunk would fail its whole
+ * batch and take a usable source out of the corpus with it.
+ *
+ * The chunker targets a few hundred tokens (§5.5), so this should never fire.
+ * It exists because "should never fire" is exactly what was assumed about the
+ * rate limit. Clamped well below the ceiling, since estimateTokens is an
+ * estimate and a boundary this cheap is not worth being precise about.
+ */
+const MAX_INPUT_CHARS = 24_000;
+
+function clampToTokenLimit(text: string): string {
+  return text.length > MAX_INPUT_CHARS ? text.slice(0, MAX_INPUT_CHARS) : text;
+}
+
+/** Enough attempts to outlast a per-minute rate-limit window. */
+const EMBED_RETRY_ATTEMPTS = 4;
+
+/**
+ * Minimum gap between embedding requests, process-wide.
+ *
+ * Backing off after a 429 is recovery; this is prevention. Sized for OpenAI's
+ * paid limits (thousands of requests a minute), so this is a courtesy spacer
+ * rather than the load-bearing throttle it had to be on Voyage's free tier —
+ * where 1.2s a call was the difference between a full corpus and two sources.
+ */
+const MIN_REQUEST_GAP_MS = 50;
+
+let lastRequestAt = 0;
+
+async function paceRequest(): Promise<void> {
+  const since = Date.now() - lastRequestAt;
+  if (since < MIN_REQUEST_GAP_MS) {
+    await sleep(MIN_REQUEST_GAP_MS - since);
+  }
+  lastRequestAt = Date.now();
+}
+
+/**
+ * How long to wait before trying again.
+ *
+ * A 429 from Voyage is a per-MINUTE quota, so the wait has to be measured in
+ * tens of seconds — 15s, 30s, 45s, 60s. Anything shorter just spends another
+ * request confirming the window has not reset, which is what threw away six
+ * usable articles.
+ *
+ * Other errors (5xx, a dropped connection) back off in seconds, since those
+ * clear quickly or not at all.
+ */
+function backoffMs(attempt: number, status?: number): number {
+  const jitter = Math.random() * 1_000;
+  if (status === 429) return 15_000 * (attempt + 1) + jitter;
+  return 2_000 * (attempt + 1) + jitter;
 }
 
 // ─── Similarity ─────────────────────────────────────────────────────────────

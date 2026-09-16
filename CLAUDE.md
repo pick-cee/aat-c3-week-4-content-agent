@@ -35,7 +35,7 @@ secrets. Working on the happy path is the baseline, not the goal.
 ## Stack
 
 Next.js (App Router) on Vercel · Supabase Postgres with pgvector · Anthropic API ·
-Firecrawl · Voyage AI embeddings · Resend. TypeScript throughout.
+Firecrawl · OpenAI embeddings · Resend. TypeScript throughout.
 
 ## Rules that are not negotiable
 
@@ -138,6 +138,130 @@ screenshot or the video.
     `activity_log` row, and an email to the request's creator when terminal. A
     retry button appears only where retrying could actually help.
 
+11a. **A retry that cannot happen twice is not a retry.** A failure flag must
+    record *why* it failed, not just *that* it did. `embed_failed` conflated a
+    per-minute rate limit with a page that can never be embedded, and the
+    pending filter excluded both forever — so six fetched articles of 20k–36k
+    characters were refused once and never looked at again. Retrying the request
+    could not recover them, because nothing re-examined them.
+
+    The visible symptom appeared three steps and two model calls later as
+    *"these three angles are too similar"*, which is a true observation with an
+    entirely unrelated apparent cause. When a complaint points at a late stage,
+    check what the early stages actually put in the table before tuning the
+    prompt that produced the complaint.
+
+    Any flag that gates future work carries a retryable/permanent distinction
+    and an attempt count. Transient means try again with a backoff matched to
+    the window being waited on — a per-minute quota is not cleared by a retry a
+    second later — and the attempt cap is what keeps that terminating. Pacing to
+    avoid the limit and backing off after hitting it are separate mechanisms;
+    both are needed.
+
+11c. **Never say "retrying" unless something will actually retry.** `runStep`
+    returned `more: false` on every failure, retryable ones included. The runner
+    wrote "Trying again (attempt 1 of 3)" to the log and the client poller — the
+    only thing that performs that retry while a person is watching — read the
+    same response and stopped. The retry never happened. The request sat at
+    `evaluating` behind a spinner that never resolved, which is worse than an
+    error: an error can be acted on.
+
+    `more` means "a retry is coming", not "something went wrong", and
+    `willRetryAfterFailure` is the single rule both sides read.
+
+    The underlying failure was a BUDGET refusal, which evaluation had caught,
+    retried once at identical cost, and flattened into a string — destroying
+    the `BudgetExceededError` type the runner uses to route it to
+    `budget_exceeded`. So a permanent condition was presented as a transient
+    one, four attempts were spent proving it, and the message said "retrying
+    usually clears it" about the one thing retrying can never clear. A typed
+    error that carries "this cannot succeed later" must never be downgraded to
+    a generic one.
+
+    When a step cannot proceed, say what it needs and who can supply it. "Needs
+    about $0.41, $0.19 left, raise the budget to $0.60 and run it again" is
+    actionable. "The quality check could not complete" is not.
+
+11d. **Approved work is never invisible.** A state with no representation in the
+    schema becomes a code path that skips the write. `publish_queue.scheduled_for`
+    was NOT NULL, so "approved, no send time yet" could not be stored — and the
+    approval action logged "held in the queue" for a row it never created. The
+    channel read `approved`, the request moved to `scheduled`, and the queue was
+    empty. The item existed on no screen in the product.
+
+    When a state is real, give it a value. `held` plus a nullable send time plus
+    a check constraint keeping them consistent, rather than a branch that
+    silently declines to insert. If a log line describes a row, that row exists.
+
+    The same rule caught the other half: a gate that runs before the branch it
+    depends on applies to cases it was never meant for. The connector check ran
+    ahead of the `kind` branch and blocked every handoff item on a credential
+    the design deliberately does not require. Order the guard after the
+    distinction it relies on, and extract the rule so it can be tested.
+
+11e. **One flag must not answer two questions.** Gate two derived a single
+    `readOnly` from `status !== "content_review"` and used it for both "can the
+    article be edited" and "can the channels be decided". Approving one channel
+    moves the request to `scheduled`, so approving LinkedIn removed the approve
+    button from the newsletter — which was still a draft, and which the server
+    would have accepted. One approval silently ended the review, and the only
+    way to use the product was to never approve anything until you had decided
+    everything.
+
+    The server never had the restriction. It was the UI locking itself, which
+    is why nothing failed and no error appeared. `isArticleLocked` and
+    `areChannelsLocked` are now separate, pure, and tested — a UI gate that
+    silently removes an action is invisible to the type system and visible only
+    by clicking the button once.
+
+11f. **"Nothing found" must be falsy, and a failed write must not report
+    success.** Two habits produced the same class of silent bug.
+
+    `claim_due_publish_item()` was declared `returns publish_queue`, a scalar
+    composite, so an UPDATE matching nothing returned a row with every field
+    NULL. The guard `if (error || !data) return null` passed, because an object
+    of nulls is truthy. The worker took the phantom for a real item and logged
+    `channel_output <NULL> does not exist` on every sweep. `returns setof`
+    returns zero rows, which is what "nothing" means; PostgREST then sends
+    `[]`, which is ALSO truthy, so the guard checks the id rather than the
+    container. A claim helper returns a row or null, never a shape that has to
+    be interrogated at the call site.
+
+    `cancelQueueItem` discarded the update error and returned `ok: true`
+    regardless, so when a check constraint rejected the write the button
+    reported success and did nothing. Every write checks its error and every
+    failure reaches the person who asked for it.
+
+    The constraint itself was mine: `(held and no time) or (not held and a
+    time)` made cancelling a held row impossible, because cancelling leaves the
+    time null. A constraint has to permit every legal transition out of the
+    state it describes, not just the state itself.
+
+11g. **A check must measure the artefact as it actually exists.** Three
+    separate checks failed a good article, and every one was measuring
+    something the pipeline does not produce at that moment.
+
+    · The SEO check counted `[text](url)` markdown links. The model is
+      FORBIDDEN from writing a URL (rule 3): it writes `((link: anchor | E12))`
+      and the server substitutes at publish. So it reported zero links on an
+      article with three, and no revision could pass, because passing would
+      have meant breaking rule 3.
+
+    · The figure check compared numbers as literal substrings, so `0.38` did
+      not match a source writing `.38` and `4,312` did not match `4312`. It
+      also captured trailing punctuation (`"38,"`) and pulled digits out of
+      citation labels (`E14` became the figure `14`).
+
+    · The tripwire scanned headings and table rows as prose and flagged each as
+      an uncited claim. A marker cannot go on an H2 without rendering inside
+      the heading.
+
+    The article was never wrong. The checks were, and each wasted every
+    revision round chasing a defect that did not exist. Before adding a check,
+    write down what the artefact looks like AT THAT STEP: pre-substitution,
+    pre-render, with its markers intact. A check that cannot be satisfied
+    without violating another rule is not strict, it is broken.
+
 11b. **A `grant` is not a boundary until the default is revoked.** Postgres
     grants EXECUTE to PUBLIC on every function it creates. Adding
     `grant execute … to service_role` therefore *adds* a grant without removing
@@ -154,10 +278,36 @@ screenshot or the video.
     two named reads. The check is standing, not a one-time audit, because the
     default privilege is what caused this.
 
-12. **Secrets are server-side only.** Anthropic, Firecrawl, Voyage, Resend,
+12. **Secrets are server-side only.** Anthropic, Firecrawl, OpenAI, Resend,
     Supabase service role, LinkedIn and X credentials never reach the browser.
     Connector tokens are encrypted at rest. `.env*` is gitignored before the
     first commit; a secret in git history is a leaked secret.
+
+## Component structure
+
+One screen is not one file. Gate two was 858 lines holding the article viewer,
+the channel approver, the image picker, the source list, the version history and
+the orchestration, and it threaded `pending`, `canApprove` and a callback per
+action down through every panel.
+
+Two concrete failures came out of that, neither visible to the type system:
+approving one channel put a spinner on every button on the screen, because
+`pending` was shared; and a single `readOnly` flag answered two different
+questions, which locked the newsletter out of review.
+
+- **A panel owns its actions.** It calls the server action itself and holds its
+  own pending and error state (`review/use-action.ts`). A parent arranging
+  transitions for its children is a parent owning state it does not use.
+- **A component takes the facts it reads, not the object that contains them.**
+  `ChannelsPanel` takes `holdInQueue` and `publishTarget`, never the whole
+  `request` — passing the record couples every panel to every field.
+- **The orchestrator composes.** `gate-two.tsx` decides which panel is showing
+  and owns the article, because editing the article invalidates everything else
+  on the page. Nothing else belongs there.
+- **Rules that gate an action are pure, exported and tested**
+  (`review-locks.ts`, `publish/gate.ts`). A UI gate that silently removes a
+  button fails no test and throws no error; the only way to catch it is to make
+  the rule a function with cases.
 
 ## Interface principle
 
@@ -165,6 +315,42 @@ Understandable in five seconds, readable after that. Status, ownership and
 what-needs-me come first and visually. Prose supports; it is not the entry point.
 Failed, blocked and uncertain items sort above everything else. A founder should
 know the state of the operation without reading a paragraph.
+
+**The machine does the arithmetic.** Anything with an exact mechanical answer is
+computed, never handed back as a task. "Post weighs 326 characters and the limit
+is 280, cut at least 46" is the system asking a founder to do its job; an X post
+that overshoots twice is trimmed at a sentence boundary and marked as trimmed.
+Judgment calls still go to a person — too few hashtags, a missing core idea, a
+weak citation — but a number that can be satisfied exactly is satisfied.
+
+**Evidence is shown whole.** A flagged claim truncated at 160 characters cannot
+be checked, which defeats the point of flagging it. Advice is a list, not a
+paragraph: five discrete changes can be read and worked through, while the same
+five run together have to be unpicked first. Cap the count in the schema, since
+structured outputs reject `maxItems`.
+
+**Visual calibration** follows the tools this is measured against (Vercel,
+Linear, Supabase): a 4px grid, hairline borders rather than shadows on every
+card, 14px body with 13px secondary and 12px meta, tight tracking on headings
+and normal on reading text, tabular figures for anything that updates, and one
+accent colour — because colour means status here, and spending it on decoration
+leaves nothing to say "this failed" with. Dark mode is a first-class palette,
+not an inversion.
+
+**Money spent is a fact about the past.** No later action makes it untrue.
+Deleting a request hides it and keeps its costs; a cost report that a delete can
+rewrite is not a report. Purging for good rolls the spend into a standalone
+ledger that references nothing, so there is no row whose removal can take it
+away.
+
+**No em dashes in generated content.** They are the single clearest tell that a
+machine wrote the text. Forbidden in the prompt on every call (`PUNCTUATION_BLOCK`,
+which sits outside `brandVoiceBlock` because every call site applies that one
+conditionally), and removed mechanically at `saveVersion` and `saveOutput` —
+because asking a model not to use them does not reliably work, and rejecting a
+whole draft over punctuation would spend a redraft on something with an exact
+fix. The count that got through is logged, so "the prompt is working" is a
+number rather than a hope.
 
 ## Models
 
@@ -217,7 +403,7 @@ Record `model_used`, `input_tokens`, `output_tokens`, `cache_read_tokens` and
 ## Conventions
 
 - Server actions or route handlers for anything touching a key. No client-side
-  calls to Anthropic, Firecrawl, Voyage, LinkedIn or X, ever.
+  calls to Anthropic, Firecrawl, OpenAI, LinkedIn or X, ever.
 - The public article permalink at `/a/[slug]` selects an explicit column list.
   Never `select *` on a route that renders to signed-out visitors.
 - Sentence segmentation uses `Intl.Segmenter`, never a split on `.`, because the

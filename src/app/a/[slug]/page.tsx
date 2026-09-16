@@ -111,7 +111,9 @@ export default async function ArticlePage({
   const revised = (version.version as number) > 1;
 
   return (
-    <article style={{ maxWidth: 720, margin: "0 auto" }}>
+    /* Its own reading page, not a view inside the workspace. The app shell
+       used to supply the padding; this route no longer has one. */
+    <article className="public-article">
       {request.status === "content_review" && (
         <div className="alert alert-warn small">
           This article is still under review. It has not been approved for publishing.
@@ -151,7 +153,7 @@ export default async function ArticlePage({
             {image?.attribution_text as string}
             {image?.licence && (
               <>
-                {" — "}
+                {", "}
                 {image.licence_url ? (
                   <a href={image.licence_url as string} target="_blank" rel="noopener noreferrer">
                     {image.licence as string}
@@ -188,7 +190,7 @@ export default async function ArticlePage({
                 {source.title ?? source.url}
               </a>
               <span className="dim">
-                {source.site_name && ` — ${source.site_name}`}
+                {source.site_name && `, ${source.site_name}`}
                 {source.published_at &&
                   `, ${new Date(source.published_at).toLocaleDateString("en-GB")}`}
               </span>

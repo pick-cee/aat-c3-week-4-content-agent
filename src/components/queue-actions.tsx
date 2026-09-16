@@ -63,7 +63,7 @@ export function QueueActions({
           />
         )}
 
-        <div className="row" style={{ gap: 6 }}>
+        <div className="btn-row">
           <button
             className="btn btn-sm"
             disabled={pending || (item.kind === "handoff" && !url.trim())}
@@ -106,7 +106,8 @@ export function QueueActions({
     );
   }
 
-  const canReschedule = ["queued", "blocked_not_connected", "failed"].includes(item.status);
+  const isHeld = item.status === "held";
+  const canReschedule = ["queued", "held", "blocked_not_connected", "failed"].includes(item.status);
 
   if (!canReschedule) return null;
 
@@ -115,7 +116,7 @@ export function QueueActions({
       {error && <div className="alert alert-error tiny mb-0">{error}</div>}
 
       {showReschedule ? (
-        <div className="row" style={{ gap: 6 }}>
+        <div className="btn-row">
           <input
             type="datetime-local"
             value={when}
@@ -140,9 +141,14 @@ export function QueueActions({
           </button>
         </div>
       ) : (
-        <div className="row" style={{ gap: 6 }}>
-          <button className="btn btn-sm" onClick={() => setShowReschedule(true)}>
-            Reschedule
+        <div className="btn-row">
+          {/* A held item has never had a time, so "Reschedule" would be the
+              wrong word for the one action it needs. */}
+          <button
+            className={isHeld ? "btn btn-sm btn-primary" : "btn btn-sm"}
+            onClick={() => setShowReschedule(true)}
+          >
+            {isHeld ? "Set a send time" : "Reschedule"}
           </button>
           <button
             className="btn btn-sm btn-ghost"

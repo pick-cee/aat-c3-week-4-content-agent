@@ -71,6 +71,8 @@ export type ChannelOutputStatus = "draft" | "approved" | "rejected" | "format_fa
  */
 export type PublishStatus =
   | "queued"
+  /** Approved, with no send time yet. A real row, deliberately not due. */
+  | "held"
   | "publishing"
   | "published"
   | "awaiting_manual_post"
@@ -104,6 +106,9 @@ export type ConnectorStatus =
   | "expired"
   | "revoked"
   | "error";
+
+/** The five visual weights a status can carry. Shared by pills and chips. */
+export type Tone = "ok" | "warn" | "danger" | "info" | "accent";
 
 export type ArticleOrigin = "initial" | "revision" | "human_edit";
 export type SourceOrigin = "seed" | "discovered";
@@ -182,6 +187,9 @@ export interface ContentRequest {
   submit_token: string | null;
   publish_target: string | null;
   hold_in_queue: boolean;
+  /** Set when the request is in the recycle bin. Its costs still count. */
+  deleted_at: string | null;
+  deleted_by: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -207,6 +215,9 @@ export interface Source {
   relevance_score: number | null;
   embed_failed: boolean;
   embed_error: string | null;
+  /** True when the last embedding failure was transient and worth retrying. */
+  embed_retryable: boolean;
+  embed_attempts: number;
   included: boolean;
   excluded_by: string | null;
   excluded_reason: string | null;
@@ -334,6 +345,17 @@ export interface ComputedChecks {
   factualConsistency: {
     unsupportedCandidates: number;
     numberDisagreements: number;
+    /**
+     * The offending figures, so a revision can correct them rather than guess.
+     * Only a count was stored, and the same check then failed three revisions
+     * in a row because nothing said WHICH number was wrong.
+     */
+    numberDisagreementDetail?: {
+      sentence: string;
+      number: string;
+      labels: string[];
+      citedText: string;
+    }[];
     passed: boolean;
   };
   seoFit: {
@@ -366,7 +388,7 @@ export interface Evaluation {
   unsupported_claims: ClaimMapEntry[] | null;
   weak_citations: ClaimMapEntry[] | null;
   sections_to_revise: { heading: string; problem: string }[] | null;
-  recommended_changes: string | null;
+  recommended_changes: string[] | null;
   overall_note: string | null;
   judge_verdict: string | null;
   /** The judge's verdict does not decide; a computed failure overrules it. §11.2. */
@@ -399,6 +421,8 @@ export interface ChannelOutput {
   claim_map: ClaimMapEntry[] | null;
   format_check: FormatCheckResult | null;
   status: ChannelOutputStatus;
+  /** True when the body was shortened in code to fit the channel limit. */
+  auto_trimmed: boolean;
   model_used: string | null;
   input_tokens: number | null;
   output_tokens: number | null;
@@ -442,7 +466,8 @@ export interface PublishQueueItem {
   channel_output_id: string;
   channel: ChannelName;
   kind: ConnectorKind;
-  scheduled_for: string;
+  /** NULL when status is 'held': approved, with no send time decided yet. */
+  scheduled_for: string | null;
   status: PublishStatus;
   attempt: number;
   max_attempts: number;
@@ -587,6 +612,11 @@ export interface Database {
       claim_request_lease: {
         Args: { p_request_id: string; p_lease_id: string; p_lease_secs?: number };
         Returns: ContentRequest;
+      };
+      /** Copies a request's spend to the standalone ledger before a purge. */
+      retain_request_spend: {
+        Args: { p_request_id: string };
+        Returns: void;
       };
       claim_next_runnable_request: {
         Args: { p_lease_id: string; p_lease_secs?: number };

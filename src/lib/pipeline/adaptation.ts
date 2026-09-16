@@ -3,15 +3,15 @@ import { serviceClient, table } from "@/lib/db/client";
 import { logInfo, logWarn } from "@/lib/log";
 import { callStructured, recordDiscarded } from "@/lib/providers/anthropic";
 import { checkInheritedMarkers, stripMarkers } from "./grounding";
-import { checkLinkedIn, checkNewsletter, checkX } from "./checks";
-import { brandVoiceBlock, channelRulesBlock } from "./prompts";
+import { checkLinkedIn, checkNewsletter, checkX, replaceEmDashes } from "./checks";
+import { brandVoiceBlock, channelRulesBlock, PUNCTUATION_BLOCK } from "./prompts";
 import {
   MODELS,
   MAX_TOKENS,
   CHANNEL_LIMITS,
   CHANNEL_FORMAT_RETRIES,
 } from "@/lib/constants";
-import { countXCharacters } from "@/lib/text";
+import { countXCharacters, trimXPost } from "@/lib/text";
 import { env } from "@/lib/env";
 import type {
   ArticleVersion,
@@ -141,7 +141,7 @@ export async function adaptChannel(
       text:
         "You adapt a finished, approved article for one channel.\n\n" +
         "You have the article and nothing else. You have no web access and no source " +
-        "material. Every claim you make must already be in the article — if the article " +
+        "material. Every claim you make must already be in the article, if the article " +
         "does not contain a fact, you cannot use it, and you must not reach for anything " +
         "you happen to know about the topic.\n\n" +
         "Keep the article's citation markers ([E12]) on any sentence you carry over that " +
@@ -151,6 +151,7 @@ export async function adaptChannel(
     },
     { text: channelRulesBlock(channel, voice?.emoji_allowance ?? 3), cache: true },
     ...(voice ? [{ text: brandVoiceBlock(voice), cache: true }] : []),
+    { text: PUNCTUATION_BLOCK, cache: true },
   ];
 
   const basePrompt = buildAdaptPrompt(request, version, channel, includeLink ? articleUrl : null);
@@ -226,6 +227,44 @@ export async function adaptChannel(
     attempt++;
   }
 
+  /**
+   * Last resort for X: cut it to fit.
+   *
+   * Length is the only format rule with an exact mechanical answer, so telling
+   * a founder "cut at least 46 characters" is handing them arithmetic instead
+   * of a finished post. Everything else — too few hashtags, no line break, a
+   * missing core idea — is a judgment call and still goes to a person.
+   *
+   * The trim is recorded on the row so the edit is visible rather than silent.
+   */
+  if (channel === "x" && lastOutput && overLengthOnly(lastCheck)) {
+    const trimmedBody = trimXPost(lastOutput.body, lastOutput.hashtags ?? []);
+    const trimmed = { ...lastOutput, body: trimmedBody };
+    const recheck = runFormatCheck(channel, trimmed, voice, includeLink ? articleUrl : null);
+
+    if (recheck.passed) {
+      const output = await saveOutput({
+        request,
+        version,
+        channel,
+        result: trimmed,
+        check: recheck,
+        articleUrl: includeLink ? articleUrl : null,
+        status: "draft",
+        usage: { inputTokens: 0, outputTokens: 0 },
+        autoTrimmed: true,
+      });
+
+      await logInfo(
+        `The X post came back over the limit twice, so it was shortened to fit. ` +
+          `It is ready to review.`,
+        { requestId: request.id, step: "adapt", detail: { channel } },
+      );
+
+      return { channel, output, formatCheck: recheck, formatFailed: false };
+    }
+  }
+
   // Second failure: format_failed on THIS channel only (§12.1).
   const output = lastOutput
     ? await saveOutput({
@@ -250,6 +289,18 @@ export async function adaptChannel(
   );
 
   return { channel, output, formatCheck: lastCheck, formatFailed: true };
+}
+
+/**
+ * True when length is the ONLY thing wrong.
+ *
+ * Trimming fixes length and nothing else, so a post that is also missing its
+ * hashtags or its core idea still needs a person. Checking this rather than
+ * trimming on any failure is what keeps the automatic edit safe.
+ */
+function overLengthOnly(check: FormatCheckResult): boolean {
+  const failed = check.checks.filter((c) => !c.passed);
+  return failed.length > 0 && failed.every((c) => c.name.includes("Within 280 characters"));
 }
 
 function runFormatCheck(
@@ -345,6 +396,8 @@ interface SaveOutputInput {
   articleUrl: string | null;
   status: "draft" | "format_failed";
   usage: { inputTokens: number; outputTokens: number };
+  /** Set when the body was shortened in code to fit the channel limit. */
+  autoTrimmed?: boolean;
 }
 
 async function saveOutput(input: SaveOutputInput): Promise<ChannelOutput> {
@@ -353,7 +406,11 @@ async function saveOutput(input: SaveOutputInput): Promise<ChannelOutput> {
 
   // Stored as the reader will see it. The markers did their job at check time
   // and have no business reaching a recipient.
-  const readerBody = stripMarkers(result.body);
+  //
+  // Em dashes go the same way as in the article (saveVersion): the prompt
+  // forbids them and this is the mechanical guarantee, applied to the subject
+  // line and the CTA as well since those are read as carefully as the body.
+  const readerBody = replaceEmDashes(stripMarkers(result.body));
 
   const claimMap = (version.claim_map ?? []) as ClaimMapEntry[];
   const inheritedLabels = new Set(
@@ -381,16 +438,17 @@ async function saveOutput(input: SaveOutputInput): Promise<ChannelOutput> {
       article_version_id: version.id,
       channel,
       version: nextVersion,
-      subject: result.subject ?? null,
+      subject: result.subject ? replaceEmDashes(result.subject) : null,
       body: readerBody,
       hashtags: result.hashtags ?? [],
-      cta: result.cta ?? null,
+      cta: result.cta ? replaceEmDashes(result.cta) : null,
       includes_link: Boolean(articleUrl),
       link_url: articleUrl,
       char_count: channel === "x" ? countXCharacters(readerBody) : readerBody.length,
       claim_map: inheritedClaims as never,
       format_check: check as never,
       status,
+      auto_trimmed: input.autoTrimmed ?? false,
       model_used: MODELS.adaptation,
       input_tokens: input.usage.inputTokens,
       output_tokens: input.usage.outputTokens,

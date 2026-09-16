@@ -93,10 +93,15 @@ export class BudgetExceededError extends Error {
     public readonly wouldSpendCents: number,
     public readonly budgetCents: number,
   ) {
+    // Says what happened, what it would take, and what to do. A budget refusal
+    // is permanent until someone changes the budget — never implying a retry
+    // would help is the whole point.
     super(
-      `This step would cost about ${formatCents(wouldSpendCents)}, and ` +
-        `${formatCents(spentCents)} of the ${formatCents(budgetCents)} budget is ` +
-        `already spent. The request stopped here with everything produced so far intact.`,
+      `This step needs about ${formatCents(wouldSpendCents)} and only ` +
+        `${formatCents(Math.max(0, budgetCents - spentCents))} of the ` +
+        `${formatCents(budgetCents)} budget is left (${formatCents(spentCents)} spent). ` +
+        `Everything produced so far is saved. Raise the budget for this request to ` +
+        `about ${formatCents(spentCents + wouldSpendCents)} and run it again to continue.`,
     );
     this.name = "BudgetExceededError";
   }

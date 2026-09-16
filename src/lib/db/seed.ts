@@ -19,7 +19,7 @@ import { DEMO_ACCOUNT } from "@/lib/personas";
  */
 
 const DEFAULT_VOICE = {
-  name: "Koya Talent — house voice",
+  name: "Koya Talent house voice",
   description:
     "Direct, evidence-led writing for an African talent and marketing audience. " +
     "Plain sentences, concrete examples, no hype.",
@@ -64,7 +64,16 @@ export async function seedIfEmpty(): Promise<void> {
     await seedDemoAccounts(db);
     await seedBrandVoice(db);
     await seedConnectors(db);
-    if (env.app.demoMode) await seedDemoRecipients(db);
+    /**
+     * Demo recipients are NOT seeded.
+     *
+     * Six fixture addresses on first boot meant a founder opened Settings to a
+     * newsletter list of strangers they were now responsible for. The broken
+     * input pack builds the rows it needs for its own run instead, which is
+     * where a fixture belongs.
+     *
+     * `seedDemoRecipients` is kept for that harness to call deliberately.
+     */
   } catch (err) {
     // Never block startup. A seed failure shows up at /api/health.
     console.error("[seed] failed:", err);

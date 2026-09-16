@@ -88,7 +88,7 @@ export default async function UnsubscribePage({
     <Shell heading={alreadyDone ? "You were already unsubscribed" : "You have been unsubscribed"}>
       <p className="muted mb-0">
         {alreadyDone
-          ? "There is nothing more to do — you are not on the list."
+          ? "There is nothing more to do, you are not on the list."
           : "That takes effect immediately. You will not receive another newsletter from us."}
       </p>
     </Shell>

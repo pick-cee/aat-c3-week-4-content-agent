@@ -50,7 +50,7 @@ export function DeleteRequest({ requestId, compact }: { requestId: string; compa
   }
 
   return (
-    <span className="row" style={{ gap: 6 }}>
+    <span className="btn-row">
       <span className="tiny muted nowrap">Delete for good?</span>
       <button
         className="btn btn-danger btn-sm"

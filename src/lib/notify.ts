@@ -173,7 +173,7 @@ export async function sendHandoffPacket(input: {
 
   const result = await sendEmail({
     to: input.to,
-    subject: `${heading} — scheduled for ${formatTime(input.scheduledFor)}`,
+    subject: `${heading}, scheduled for ${formatTime(input.scheduledFor)}`,
     html: layout(
       heading,
       `<p>This was approved and scheduled for <strong>${escapeHtml(formatTime(input.scheduledFor))}</strong>.
@@ -183,7 +183,7 @@ export async function sendHandoffPacket(input: {
        ${input.articleUrl ? `<p><strong>Article link:</strong> <a href="${input.articleUrl}">${escapeHtml(input.articleUrl)}</a></p>` : ""}
        <p style="margin-top:24px">Once you have posted it, confirm with the URL so the queue reflects reality:</p>
        <p><a href="${input.confirmUrl}" style="display:inline-block;background:#111827;color:#fff;padding:10px 16px;border-radius:6px;text-decoration:none">Confirm the post</a></p>
-       <p style="color:#6b7280;font-size:13px">Until you confirm, this shows as awaiting a manual post — never as published.</p>`,
+       <p style="color:#6b7280;font-size:13px">Until you confirm, this shows as awaiting a manual post, never as published.</p>`,
     ),
     text: [
       heading,

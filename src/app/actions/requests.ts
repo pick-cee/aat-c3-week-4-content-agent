@@ -78,7 +78,7 @@ export async function createRequest(
   if (input.seedUrls.length > MAX_SEED_URLS) {
     return {
       ok: false,
-      error: `At most ${MAX_SEED_URLS} source URLs — ingestion cost scales with this.`,
+      error: `At most ${MAX_SEED_URLS} source URLs, ingestion cost scales with this.`,
     };
   }
 
@@ -160,9 +160,30 @@ export async function createRequest(
   // ── The estimate, shown before research starts (§6) ──
 
   const estimate = estimateRequestCost(deduped.length, channels.length);
-  const budget = profile.is_demo
-    ? Math.min(input.budgetCents, env.limits.demoBudgetCents)
-    : input.budgetCents;
+
+  /**
+   * The demo cap is real, but it must not be applied silently.
+   *
+   * A request created with $1.20 was clamped to the $0.60 demo ceiling without
+   * a word, and then stopped mid-pipeline saying the budget was reached. The
+   * person had set a budget that would have covered it; the system quietly
+   * replaced their number with a smaller one and later blamed the budget.
+   *
+   * The cap still holds. It is now refused and explained rather than applied
+   * behind the user's back.
+   */
+  const demoCap = env.limits.demoBudgetCents;
+  if (profile.is_demo && input.budgetCents > demoCap) {
+    return {
+      ok: false,
+      error:
+        `The demo workspace caps a request at ${formatCents(demoCap)}, and you asked for ` +
+        `${formatCents(input.budgetCents)}. Lower the budget to ${formatCents(demoCap)} or ` +
+        `less, or set DEMO_WORKSPACE_BUDGET_CENTS higher to raise the cap.`,
+    };
+  }
+
+  const budget = input.budgetCents;
 
   if (estimate > budget) {
     return {
@@ -508,23 +529,116 @@ export async function deleteRequest(requestId: string): Promise<ActionResult> {
     return {
       ok: false,
       error:
-        "This request has content that went out, so it cannot be deleted — that record is " +
+        "This request has content that went out, so it cannot be deleted, that record is " +
         "the only proof of what was published. Cancel it instead.",
     };
   }
 
-  const { error } = await db.from(table("content_requests")).delete().eq("id", requestId);
+  /**
+   * Soft delete. The row stays; it is hidden.
+   *
+   * A hard delete cascaded to `model_calls` and took the costs with it, so
+   * "Spent this month" read $0 after clearing out a few drafts even though the
+   * money had genuinely left the account. Money spent is a fact about the
+   * past — no later action makes it untrue, and a cost report a delete can
+   * rewrite is not a report.
+   *
+   * It is recoverable from the recycle bin, and `deleted_at` is what every
+   * list filters on.
+   */
+  const { error } = await db
+    .from(table("content_requests"))
+    .update({ deleted_at: new Date().toISOString(), deleted_by: profile.id })
+    .eq("id", requestId)
+    .is("deleted_at", null);
 
   if (error) return { ok: false, error: `Could not delete it: ${error.message}` };
 
-  // Logged without a request_id: the row it would reference is gone, and a
-  // foreign key to a deleted request would fail the insert.
   await logInfo(
-    `Deleted a request that was ${row.status}. Its sources, drafts and channel outputs went with it.`,
+    `Moved a request that was ${row.status} to the recycle bin. Its costs still count ` +
+      `towards this month's spend.`,
+    { requestId, actorId: profile.id },
+  );
+
+  revalidatePath("/");
+  revalidatePath("/recycle-bin");
+  return { ok: true };
+}
+
+/** Puts a soft-deleted request back on the dashboard. */
+export async function restoreRequest(requestId: string): Promise<ActionResult> {
+  const profile = await currentProfile();
+  if (!profile) return { ok: false, error: "You need to be signed in." };
+
+  const db = serviceClient();
+  const { error } = await db
+    .from(table("content_requests"))
+    .update({ deleted_at: null, deleted_by: null })
+    .eq("id", requestId)
+    .not("deleted_at", "is", null);
+
+  if (error) return { ok: false, error: `Could not restore it: ${error.message}` };
+
+  await logInfo("Restored a request from the recycle bin.", {
+    requestId,
+    actorId: profile.id,
+  });
+
+  revalidatePath("/");
+  revalidatePath("/recycle-bin");
+  return { ok: true };
+}
+
+/**
+ * Permanent delete, from the recycle bin only.
+ *
+ * The spend is copied to `retained_spend` first, so emptying the bin still
+ * cannot make a month's costs understate what was actually spent. This is the
+ * only path that removes a request row.
+ */
+export async function purgeRequest(requestId: string): Promise<ActionResult> {
+  const profile = await currentProfile();
+  if (!profile) return { ok: false, error: "You need to be signed in." };
+  if (!canApprove(profile)) {
+    return { ok: false, error: "Only a reviewer or admin can permanently delete a request." };
+  }
+
+  const db = serviceClient();
+
+  const { data: row } = await db
+    .from(table("content_requests"))
+    .select("id, deleted_at, idea")
+    .eq("id", requestId)
+    .maybeSingle();
+
+  if (!row) return { ok: false, error: "That request no longer exists." };
+  if (!row.deleted_at) {
+    return { ok: false, error: "Move it to the recycle bin first." };
+  }
+
+  // Preserve the spend before the cascade removes the model_calls rows.
+  const { error: keepError } = await db.rpc("retain_request_spend", {
+    p_request_id: requestId,
+  });
+
+  if (keepError) {
+    return {
+      ok: false,
+      error: `Could not preserve this request's costs, so it was not deleted: ${keepError.message}`,
+    };
+  }
+
+  const { error } = await db.from(table("content_requests")).delete().eq("id", requestId);
+  if (error) return { ok: false, error: `Could not delete it: ${error.message}` };
+
+  // No request_id: the row it would reference is gone.
+  await logInfo(
+    `Permanently deleted a request. Its costs were kept in the monthly total.`,
     { actorId: profile.id, detail: { deletedRequestId: requestId } },
   );
 
   revalidatePath("/");
+  revalidatePath("/recycle-bin");
   return { ok: true };
 }
 

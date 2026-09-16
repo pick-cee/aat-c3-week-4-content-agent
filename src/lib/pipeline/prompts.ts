@@ -21,6 +21,25 @@ import {
  * `assets/channel-formatting-rules.md`.
  */
 
+/**
+ * Punctuation rules that apply to every generated word, brand voice or not.
+ *
+ * Em dashes are the single clearest tell that a machine wrote the text. This
+ * lives OUTSIDE brandVoiceBlock deliberately: every call site applies that one
+ * as `voice ? [block] : []`, so a request with no brand voice would silently
+ * lose the rule. It is also checked in code afterwards, because asking a model
+ * not to use them does not reliably work (rule 2: measure the instruction).
+ */
+export const PUNCTUATION_BLOCK = `── Punctuation, and this is absolute ──
+
+- NEVER use an em dash or an en dash between words. Not once. Those are the
+  characters U+2014 and U+2013.
+- Use a comma, a full stop, a colon or brackets instead. Recast the sentence
+  if you have to.
+- An en dash between NUMBERS is fine, as in a year range or a percentage band.
+- This is checked mechanically. A single one fails the draft and it is
+  written again.`;
+
 export function brandVoiceBlock(voice: BrandVoice): string {
   const parts = [`── Brand voice: ${voice.name} ──`];
 
@@ -92,13 +111,45 @@ Rules:
 - Use ONLY the excerpt labels supplied below. A marker naming an excerpt that
   was not supplied causes the entire draft to be discarded and rewritten.
 - Narrative connective tissue, the introduction's framing and the call to
-  action carry NO marker — and because they carry no marker, they must assert
+  action carry NO marker, and because they carry no marker, they must assert
   nothing. If a sentence needs a citation and has none, rewrite it so it does
   not make the claim.
+
+  Concretely, an UNMARKED sentence may not contain any of these, and a scan
+  catches each one:
+    · a percentage, an amount of money, or a year
+    · any figure beyond a plain count of things in your own argument
+    · text inside quotation marks
+    · a company, product, person or place name that appears in no excerpt
+
+  This bites hardest in the introduction and the conclusion, where it is
+  tempting to open with a statistic and close with a rousing figure. Either
+  cite it properly or write the sentence without it.
 - Do not cite an excerpt for a claim it does not actually support. Every cited
   sentence is compared against its excerpt automatically, and a real citation
   attached to an unrelated claim is caught and sent back.
-- Put the marker after the full stop.`;
+- Put the marker after the full stop.
+
+FIGURES, AND THIS IS THE CHECK THAT FAILS DRAFTS MOST OFTEN:
+
+Every number you write must appear VERBATIM in the excerpt you cite for it.
+The comparison is a literal string match, so the figure has to survive
+unchanged:
+
+- Copy it exactly. "26%" stays "26%". Do not write "about a quarter", "roughly
+  26 percent", "one in four" or "over 25%". Those all fail, even though a
+  person would call them correct.
+- Do not convert, round, combine or infer. If the excerpt says 4,312 you may
+  not write "more than 4,000". If two excerpts give parts, you may not add
+  them up.
+- Do not carry a figure from one excerpt and cite another. The number and the
+  marker travel together.
+- If you want to characterise a figure rather than state it, drop the number
+  entirely and write the claim without one. A sentence with no figure is
+  safer than a sentence with an approximated one.
+
+Before you finish, re-read every sentence containing a digit and confirm the
+digits appear in the excerpt that sentence cites.`;
 
 /**
  * Links are marked by intent and substituted server-side (rule 3, §10).
@@ -157,7 +208,7 @@ Then, within that budget:
 - ${CHANNEL_LIMITS.x.minHashtags} to ${CHANNEL_LIMITS.x.maxHashtags} relevant hashtags.
 - Tag another account only if the tag genuinely adds something.
 
-Do not carry over the article's citation markers — this post is too short to
+Do not carry over the article's citation markers, this post is too short to
 spend characters on them.`;
 
     case "newsletter":
@@ -168,7 +219,7 @@ spend characters on them.`;
 - Open with ${CHANNEL_LIMITS.newsletter.minIntroSentences} to ${CHANNEL_LIMITS.newsletter.maxIntroSentences} sentences.
 - Make the main value section skimmable: at least
   ${CHANNEL_LIMITS.newsletter.minSubheadings} subheadings, or a bulleted block.
-- Optionally add a secondary item — a quick tip, a link, an update.
+- Optionally add a secondary item, a quick tip, a link, an update.
 - A clear call to action.
 - A friendly sign-off.
 - Between ${CHANNEL_LIMITS.newsletter.minWords} and ${CHANNEL_LIMITS.newsletter.maxWords} words. This is
@@ -184,26 +235,26 @@ export const RUBRIC_BLOCK = `── Evaluation rubric ──
 
 You are judging FOUR criteria. The others (Source Grounding, Factual
 Consistency, SEO Fit, Channel Fit, Completeness) are computed mechanically and
-are not yours to assess — their results are given to you as facts.
+are not yours to assess, their results are given to you as facts.
 
-Topic Relevance — Does the content answer the request and stay focused on the
+Topic Relevance, Does the content answer the request and stay focused on the
 intended topic?
 
-Audience Fit — Does it speak to the stated target audience at the right level
+Audience Fit, Does it speak to the stated target audience at the right level
 of depth? Too basic and too advanced are both failures.
 
-Tone — Does the style match the stored brand voice, including its tone rules?
+Tone, Does the style match the stored brand voice, including its tone rules?
 Judge against the voice as written, not against your own preference.
 
-Clarity — Is it easy to read, skimmable and direct?
+Clarity, Is it easy to read, skimmable and direct?
 
 Score each 1 to 5:
-  5 — Nothing to fix.
-  4 — Good; minor polish would help.
-  3 — Acceptable but noticeably weak in a way a reader would feel.
-  2 — A real problem. Needs revision.
-  1 — Fundamentally wrong for this brief. Reject.
+  5, Nothing to fix.
+  4, Good; minor polish would help.
+  3, Acceptable but noticeably weak in a way a reader would feel.
+  2, A real problem. Needs revision.
+  1, Fundamentally wrong for this brief. Reject.
 
-If you genuinely cannot assess a criterion — the material to judge it is
-missing — return null for the score WITH a reason. Never guess a number, and
+If you genuinely cannot assess a criterion, the material to judge it is
+missing, return null for the score WITH a reason. Never guess a number, and
 never return 0. A null is a legitimate answer; an invented score is not.`;

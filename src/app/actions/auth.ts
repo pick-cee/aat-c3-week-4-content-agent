@@ -58,7 +58,7 @@ export async function signInAsDemo(): Promise<void> {
   if (error) {
     redirect(
       `/?error=${encodeURIComponent(
-        `Could not sign in: ${error.message}. The account is created at startup — check /api/health if this persists.`,
+        `Could not sign in: ${error.message}. The account is created at startup, check /api/health if this persists.`,
       )}`,
     );
   }

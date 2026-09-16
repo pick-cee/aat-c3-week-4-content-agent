@@ -4,7 +4,13 @@ import { logInfo, logWarn } from "@/lib/log";
 import { callStructured, callText } from "@/lib/providers/anthropic";
 import { buildClaimMap, type LabelledExcerpt } from "./grounding";
 import { findBannedPhrases, runSeoChecks } from "./checks";
-import { brandVoiceBlock, RUBRIC_BLOCK } from "./prompts";
+import {
+  brandVoiceBlock,
+  RUBRIC_BLOCK,
+  PUNCTUATION_BLOCK,
+  CITATION_BLOCK,
+  LINKING_BLOCK,
+} from "./prompts";
 import { saveVersion } from "./drafting";
 import {
   MAX_TOKENS,
@@ -14,6 +20,7 @@ import {
   MIN_MARKED_SENTENCE_RATIO,
 } from "@/lib/constants";
 import { segmentSentences, stripMarkdown } from "@/lib/text";
+import { BudgetExceededError } from "@/lib/cost";
 import type {
   Angle,
   ArticleVersion,
@@ -72,7 +79,22 @@ export const JUDGED_SCHEMA = {
         },
       },
     },
-    recommendedChanges: { type: "string" },
+    /**
+     * A LIST, not a paragraph.
+     *
+     * As a single string this came back as one dense block — nine separate
+     * edits run together in eleven lines, which a person has to parse before
+     * they can act on any of it. Discrete items can be read, ordered and
+     * ticked off. The description caps the count, since structured outputs
+     * reject maxItems.
+     */
+    recommendedChanges: {
+      type: "array",
+      description:
+        "At most 5 changes, each one concrete action in a single sentence under 25 words. " +
+        "Most important first. If the draft is fine, return an empty array.",
+      items: { type: "string" },
+    },
     overallStatus: { type: "string", enum: ["pass", "revise", "reject"] },
     overallNote: { type: "string" },
   },
@@ -124,7 +146,7 @@ interface JudgedOutput {
     clarity: JudgedCriterion;
   };
   sectionsToRevise: { heading: string; problem: string }[];
-  recommendedChanges: string;
+  recommendedChanges: string[];
   overallStatus: "pass" | "revise" | "reject";
   overallNote: string;
 }
@@ -166,7 +188,8 @@ export async function evaluateArticle(input: EvaluateInput): Promise<Evaluation>
   });
 
   const banned = voice ? findBannedPhrases(version.body_md, voice.banned_phrases) : [];
-  const numberDisagreements = countNumberDisagreements(claim.claimMap, excerpts);
+  const numberDisagreementDetail = findNumberDisagreements(claim.claimMap, excerpts);
+  const numberDisagreements = numberDisagreementDetail.length;
 
   const computed: ComputedChecks = {
     sourceGrounding: {
@@ -184,6 +207,7 @@ export async function evaluateArticle(input: EvaluateInput): Promise<Evaluation>
     factualConsistency: {
       unsupportedCandidates: claim.tripwireHits.length,
       numberDisagreements,
+      numberDisagreementDetail,
       passed: claim.tripwireHits.length <= MAX_UNSUPPORTED_CLAIMS && numberDisagreements === 0,
     },
     seoFit: {
@@ -212,30 +236,36 @@ export async function evaluateArticle(input: EvaluateInput): Promise<Evaluation>
   let judgeError: string | null = null;
   let usage = { inputTokens: 0, outputTokens: 0 };
 
+  // Built once so the retry below sends exactly the same thing.
+  const judgeSystem = [
+    {
+      text:
+        "You are an editor reviewing a draft against a rubric. You did not write it and " +
+        "you are not being asked to agree with whoever did.\n\n" +
+        "You are given the article, the brand voice, and the results of checks that were " +
+        "already computed mechanically. Those computed results are FACTS, do not " +
+        "re-litigate them, and do not award a criterion you are judging on the basis of " +
+        "one you are not.\n\n" +
+        "Be specific. \"The tone is off\" is not useful; \"paragraph three uses three " +
+        "abstractions where the voice calls for a concrete example\" is.",
+      cache: true,
+    },
+    { text: RUBRIC_BLOCK, cache: true },
+    ...(voice ? [{ text: brandVoiceBlock(voice), cache: true }] : []),
+    { text: PUNCTUATION_BLOCK, cache: true },
+  ];
+
+  const judgePrompt = buildJudgePrompt(request, version, computed);
+
   try {
     const result = await callStructured<JudgedOutput>({
       context: { requestId: request.id, step: "evaluate", purpose: "judge the draft" },
       model: MODELS.evaluation,
-      system: [
-        {
-          text:
-            "You are an editor reviewing a draft against a rubric. You did not write it and " +
-            "you are not being asked to agree with whoever did.\n\n" +
-            "You are given the article, the brand voice, and the results of checks that were " +
-            "already computed mechanically. Those computed results are FACTS — do not " +
-            "re-litigate them, and do not award a criterion you are judging on the basis of " +
-            "one you are not.\n\n" +
-            "Be specific. \"The tone is off\" is not useful; \"paragraph three uses three " +
-            "abstractions where the voice calls for a concrete example\" is.",
-          cache: true,
-        },
-        { text: RUBRIC_BLOCK, cache: true },
-        ...(voice ? [{ text: brandVoiceBlock(voice), cache: true }] : []),
-      ],
+      system: judgeSystem,
       // Deliberately NOT given the drafting prompt or the model's rationale:
       // it is evaluating the artefact, not agreeing with the reasoning that
       // produced it (§11.1).
-      prompt: buildJudgePrompt(request, version, computed),
+      prompt: judgePrompt,
       schema: JUDGED_SCHEMA,
       maxTokens: MAX_TOKENS.evaluation,
     });
@@ -253,7 +283,57 @@ export async function evaluateArticle(input: EvaluateInput): Promise<Evaluation>
     };
     usage = result.usage;
   } catch (err) {
-    judgeError = err instanceof Error ? err.message : String(err);
+    /**
+     * A budget refusal is not a flaky call, and retrying it is not "trying
+     * harder" — the cost of the next attempt is identical and the money is
+     * just as absent, so every retry is guaranteed to fail the same way.
+     *
+     * Rethrown so the runner sees the real type. Flattening it into
+     * `not_evaluated` cost four useless attempts and told the manager
+     * "retrying usually clears it" about the one condition retrying can never
+     * clear.
+     */
+    if (err instanceof BudgetExceededError) throw err;
+
+    /**
+     * One retry before giving up.
+     *
+     * A single flaky judge call used to stop the whole request: the status
+     * became `not_evaluated`, which can never become `pass` (§5.8), so the
+     * step runner failed it and a content manager saw a stalled request over
+     * something that would have worked on a second attempt.
+     *
+     * The rule that `not_evaluated` is not a pass is untouched. This only
+     * decides how hard we try before admitting it.
+     */
+    try {
+      const retry = await callStructured<JudgedOutput>({
+        context: { requestId: request.id, step: "evaluate", purpose: "judge the draft (retry)" },
+        model: MODELS.evaluation,
+        system: judgeSystem,
+        prompt: judgePrompt,
+        schema: JUDGED_SCHEMA,
+        maxTokens: MAX_TOKENS.evaluation,
+      });
+
+      judged = {
+        ...retry.value,
+        criteria: Object.fromEntries(
+          Object.entries(retry.value.criteria ?? {}).map(([key, criterion]) => [
+            key,
+            { ...criterion, score: normaliseScore(criterion?.score) },
+          ]),
+        ) as JudgedOutput["criteria"],
+      };
+      usage = retry.usage;
+    } catch (retryErr) {
+      // The retry can run out of budget even when the first call did not.
+      if (retryErr instanceof BudgetExceededError) throw retryErr;
+
+      judgeError =
+        `${err instanceof Error ? err.message : String(err)} ` +
+        `(retried once: ${retryErr instanceof Error ? retryErr.message : String(retryErr)})`;
+    }
   }
 
   // ── The decision, computed from the parts in code (§11.2) ──
@@ -271,7 +351,7 @@ export async function evaluateArticle(input: EvaluateInput): Promise<Evaluation>
       unsupported_claims: [...claim.unsupported, ...toEntries(claim.tripwireHits)] as never,
       weak_citations: claim.weak as never,
       sections_to_revise: (judged?.sectionsToRevise ?? []) as never,
-      recommended_changes: judged?.recommendedChanges ?? null,
+      recommended_changes: (judged?.recommendedChanges ?? []) as never,
       overall_note: judged?.overallNote ?? null,
       judge_verdict: judged?.overallStatus ?? null,
       judge_overruled: overruled,
@@ -401,12 +481,32 @@ function toEntries(hits: { sentenceIndex: number; sentence: string; reasons: str
  * actually appear in the excerpt it cites? A citation that exists and is
  * topically close can still attach to a figure the source never stated.
  */
-function countNumberDisagreements(
+export interface NumberDisagreement {
+  sentence: string;
+  /** The figure that does not appear in the cited excerpt. */
+  number: string;
+  labels: string[];
+  /** What the cited excerpt actually says, so a fix can be made from it. */
+  citedText: string;
+}
+
+/**
+ * Figures that do not appear in the excerpt they cite.
+ *
+ * This returned a COUNT and discarded everything else, so the revision prompt
+ * could say "something is wrong with a number" and nothing more. The same
+ * check then failed three revisions in a row, each one guessing, because the
+ * model was never told which figure or what the source actually said.
+ *
+ * Returning the detail is what makes the defect fixable: it is one of the most
+ * precisely diagnosable failures in the system.
+ */
+function findNumberDisagreements(
   claimMap: ClaimMapEntry[],
   excerpts: LabelledExcerpt[],
-): number {
+): NumberDisagreement[] {
   const byLabel = new Map(excerpts.map((e) => [e.label, e]));
-  let disagreements = 0;
+  const found: NumberDisagreement[] = [];
 
   for (const entry of claimMap) {
     const numbers = extractSignificantNumbers(entry.sentence);
@@ -418,14 +518,20 @@ function countNumberDisagreements(
     if (!citedText) continue;
 
     for (const number of numbers) {
-      if (!citedText.includes(number)) {
-        disagreements++;
+      if (!citedTextStatesNumber(citedText, number)) {
+        found.push({
+          sentence: entry.sentence,
+          number,
+          labels: entry.labels,
+          // Enough of the excerpt to correct the figure from.
+          citedText: citedText.slice(0, 400),
+        });
         break;
       }
     }
   }
 
-  return disagreements;
+  return found;
 }
 
 /**
@@ -434,13 +540,69 @@ function countNumberDisagreements(
  * flagging it would bury the real disagreements.
  */
 function extractSignificantNumbers(sentence: string): string[] {
-  const matches = sentence.match(/\d[\d,.]*%?/g) ?? [];
-  return matches.filter((raw) => {
-    const value = Number.parseFloat(raw.replace(/[,%]/g, ""));
-    if (!Number.isFinite(value)) return false;
-    return raw.includes("%") || raw.includes(".") || value > 10;
-  });
+  /**
+   * Strip the machinery before looking for claims.
+   *
+   * `((link: text | E14))` and `[E3]` carry excerpt LABELS, not figures. The
+   * old pattern pulled "14" out of a link marker and reported it as a figure
+   * that disagreed with its source, which no revision could ever fix because
+   * there was no figure to correct.
+   */
+  const prose = sentence
+    .replace(/\(\(link:[^)]*\)\)/g, " ")
+    .replace(/\[E\d+(?:\s*,\s*E\d+)*\]/g, " ");
+
+  // The trailing [.,] of "38." or "38," is punctuation, not part of the value.
+  /**
+   * The leading `\.?` matters: markdown stripping turns "0.38" into ".38", and
+   * a pattern that requires a leading digit captures "38" instead. That is a
+   * different number, and comparing it against the source produced a
+   * disagreement that no revision could fix.
+   */
+  const matches = prose.match(/\.\d+%?|\d[\d,]*(?:\.\d+)?%?/g) ?? [];
+
+  return matches
+    .map((raw) => raw.replace(/[.,]+$/, ""))
+    .filter((raw) => {
+      const value = Number.parseFloat(raw.replace(/[,%]/g, ""));
+      if (!Number.isFinite(value)) return false;
+      return raw.includes("%") || raw.includes(".") || value > 10;
+    });
 }
+
+/**
+ * Whether a figure appears in the text it cites.
+ *
+ * A literal `includes` was the second half of the bug: "0.38" does not appear
+ * in an excerpt that writes ".38", "4,312" does not appear in one that writes
+ * "4312", and "38%" does not appear in one that writes "38 percent". Every one
+ * of those is the same number, and reporting them as disagreements sent the
+ * article into revisions that could not succeed.
+ *
+ * Numbers are compared as VALUES. The excerpt still has to contain the figure;
+ * it simply no longer has to spell it identically.
+ */
+function citedTextStatesNumber(citedText: string, raw: string): boolean {
+  if (citedText.includes(raw)) return true;
+
+  const target = Number.parseFloat(raw.replace(/[,%]/g, ""));
+  if (!Number.isFinite(target)) return false;
+
+  // Same pattern as extraction, so ".38" in a source is read as 0.38.
+  for (const candidate of citedText.match(/\.\d+|\d[\d,]*(?:\.\d+)?/g) ?? []) {
+    const value = Number.parseFloat(candidate.replace(/,/g, ""));
+    if (!Number.isFinite(value)) continue;
+    if (value === target) return true;
+    // "0.38" written as ".38", and percentages written either way.
+    if (Math.abs(value - target) < 1e-9) return true;
+  }
+
+  return false;
+}
+
+/** Exposed for the unit test: both were silently manufacturing failures. */
+export const extractSignificantNumbersForTest = extractSignificantNumbers;
+export const citedTextStatesNumberForTest = citedTextStatesNumber;
 
 // ─── Revision (§11.3) ───────────────────────────────────────────────────────
 
@@ -468,6 +630,25 @@ export async function reviseArticle(
 
   const target = sections.length > 0 ? sections : inferSectionsFromComputed(evaluation, version);
 
+  /**
+   * What the reviewer asked for, in their words.
+   *
+   * `requestRevision` stored this note in `approvals` and nothing ever read
+   * it, so a person could write precise instructions and the revision would
+   * proceed exactly as if they had said nothing. A human note is the best
+   * information this step ever gets; it leads the prompt.
+   */
+  const { data: noteRow } = await serviceClient()
+    .from(table("approvals"))
+    .select("note, created_at")
+    .eq("request_id", request.id)
+    .eq("decision", "revision_requested")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  const humanNote = (noteRow?.note as string | null) ?? null;
+
   const result = await callText({
     context: { requestId: request.id, step: "revise", purpose: "revise the flagged sections" },
     model: MODELS.revision,
@@ -479,14 +660,35 @@ export async function reviseArticle(
           "were not asked about.\n\n" +
           "Return ONLY the replacement sections, each starting with its H2 heading exactly " +
           "as given. No preamble, no explanation, no code fence.\n\n" +
-          "Every factual sentence still needs its citation marker, using only the excerpt " +
-          "labels supplied. A claim you cannot support from these excerpts must be removed " +
-          "rather than left uncited.",
+          "You will be shown the full article for context. Returning it back is the most " +
+          "common way this step goes wrong, it wastes the revision and risks changing " +
+          "sections that already passed. Your output should be considerably SHORTER than " +
+          "the article you were given.\n\n" +
+          "Your replacement sections are judged by exactly the same checks as the original " +
+          "draft, so the rules below apply to every sentence you write.\n\n" +
+          "KEEP THE LINKS. The article needs a minimum number of link markers and they live " +
+          "inside the sections you are replacing. A revision that drops them fails the SEO " +
+          "check even when the prose is better, which is a wasted round. Carry over every " +
+          "((link: ... | E12)) marker from the section you are rewriting unless you are " +
+          "removing the sentence it sits in, and write it in that exact form.",
         cache: true,
       },
+      /**
+       * The revision is held to the same checks as the draft, so it gets the
+       * same rules.
+       *
+       * It previously got one sentence about citations and nothing about
+       * figures or links, then was graded on all three. One request failed the
+       * same figure check three rounds running, and the last attempt broke
+       * `linksResolve` on a section that had already passed, because nothing
+       * told it how links work.
+       */
+      { text: CITATION_BLOCK, cache: true },
+      { text: LINKING_BLOCK, cache: true },
       ...(voice ? [{ text: brandVoiceBlock(voice), cache: true }] : []),
+      { text: PUNCTUATION_BLOCK, cache: true },
     ],
-    prompt: buildRevisionPrompt(version, target, flagged, evaluation, excerpts),
+    prompt: buildRevisionPrompt(version, target, flagged, evaluation, excerpts, humanNote),
     maxTokens: MAX_TOKENS.revision,
     temperature: 1,
   });
@@ -530,7 +732,7 @@ function inferSectionsFromComputed(
     );
   }
   if (computed && !computed.seoFit.passed) {
-    problems.push("An SEO requirement is failing — see the computed results below.");
+    problems.push("An SEO requirement is failing, see the computed results below.");
   }
   if (computed && computed.bannedPhrases.length > 0) {
     problems.push(`Remove these banned phrases: ${computed.bannedPhrases.join(", ")}.`);
@@ -546,12 +748,28 @@ function buildRevisionPrompt(
   flagged: ClaimMapEntry[],
   evaluation: Evaluation,
   excerpts: LabelledExcerpt[],
+  humanNote: string | null,
 ): string {
-  const parts = [
+  const parts = [];
+
+  // A person's instruction outranks everything the checks inferred, so it is
+  // the first thing read.
+  if (humanNote) {
+    parts.push(
+      `── WHAT THE REVIEWER ASKED FOR ──`,
+      `A person read this draft and asked for this specific change. It takes`,
+      `priority over everything below.`,
+      ``,
+      humanNote,
+      ``,
+    );
+  }
+
+  parts.push(
     `── Sections to revise ──`,
     sections.map((s) => `## ${s.heading}\nProblem: ${s.problem}`).join("\n\n"),
     ``,
-  ];
+  );
 
   if (flagged.length > 0) {
     parts.push(
@@ -564,12 +782,47 @@ function buildRevisionPrompt(
     );
   }
 
-  if (evaluation.recommended_changes) {
-    parts.push(`── The editor's recommendation ──`, evaluation.recommended_changes, ``);
+  /**
+   * The figures that disagree with their source, named exactly.
+   *
+   * This is the check that failed three revisions in a row on one request,
+   * because the prompt said nothing about it: the model was told the article
+   * needed work and left to guess which number. Given the sentence, the
+   * figure and what the excerpt actually says, it is a mechanical fix.
+   */
+  const disagreements = evaluation.computed?.factualConsistency.numberDisagreementDetail ?? [];
+  if (disagreements.length > 0) {
+    parts.push(
+      `── FIGURES THAT DO NOT MATCH THEIR SOURCE ──`,
+      `Each of these states a number that does not appear in the excerpt it cites.`,
+      `Correct the figure to match the excerpt, or remove the claim. Do not keep`,
+      `the number and change the citation.`,
+      ``,
+      disagreements
+        .slice(0, 8)
+        .map(
+          (d) =>
+            `- The sentence: "${d.sentence}"` +
+            `\n  The figure that is wrong: ${d.number}` +
+            `\n  What the source says: "${d.citedText}"`,
+        )
+        .join("\n\n"),
+      ``,
+    );
+  }
+
+  const recommended = evaluation.recommended_changes ?? [];
+  if (recommended.length > 0) {
+    parts.push(
+      `── The editor's recommendation ──`,
+      recommended.map((change, i) => `${i + 1}. ${change}`).join("\n"),
+      ``,
+    );
   }
 
   parts.push(
-    `── The current article ──`,
+    `── The current article, for context ──`,
+    `Read it to keep your replacements consistent with the rest. Do NOT return it.`,
     ``,
     version.body_md,
     ``,
@@ -578,7 +831,25 @@ function buildRevisionPrompt(
     ``,
     excerpts.map((e) => `[${e.label}] ${e.text}`).join("\n\n"),
     ``,
-    `Return the replacement sections now.`,
+    /**
+     * Stated at the end, where the model is about to start writing.
+     *
+     * Sending the whole article for context invites returning the whole
+     * article: a four-section revision of a 1,500-word piece came back at
+     * 10,650 tokens and then hit the cap entirely. The sections are named
+     * again here so the last thing read is the scope, not the article.
+     */
+    `── What to return ──`,
+    ``,
+    `ONLY these ${sections.length} section(s), each starting with its H2 heading exactly as`,
+    `written above:`,
+    sections.map((s) => `  ## ${s.heading}`).join("\n"),
+    ``,
+    `Do not return the title, the introduction, the conclusion, or any section`,
+    `not in that list. Everything else is already approved and is left untouched —`,
+    `returning it wastes the revision and risks changing what already passed.`,
+    ``,
+    `Return those sections now, and nothing else.`,
   );
 
   return parts.join("\n");

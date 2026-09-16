@@ -67,7 +67,7 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
         to,
         subject: demo ? `[DRY RUN → ${intendedTo}] ${input.subject}` : input.subject,
         html: demo ? demoBanner(intendedTo) + input.html : input.html,
-        text: demo ? `[DRY RUN — intended for ${intendedTo}]\n\n${input.text}` : input.text,
+        text: demo ? `[DRY RUN, intended for ${intendedTo}]\n\n${input.text}` : input.text,
         ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       },
       input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : undefined,

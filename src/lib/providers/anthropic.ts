@@ -116,13 +116,34 @@ export class TruncatedResponseError extends Error {
     public readonly purpose: string,
     public readonly maxTokens: number,
   ) {
-    super(
-      `The model hit its ${maxTokens.toLocaleString()}-token limit while ${purpose}, so the ` +
-        `output is cut off mid-sentence. It was discarded rather than stored as if it were ` +
-        `finished. Raise max_tokens for this step, or narrow what it was asked to produce.`,
-    );
+    // Written for whoever reads it in the UI, which is a content manager, not
+    // the person who set the cap. "It ran out of room" is the fact; the token
+    // number belongs in the structured detail, not in a sentence aimed at
+    // someone who never chose it.
+    super(`The model ran out of room while ${purpose} and stopped mid-sentence.`);
     this.name = "TruncatedResponseError";
   }
+}
+
+/**
+ * How much room to give a retry after a truncation.
+ *
+ * Retrying an identical call is how a step fails three times and gives up
+ * having learned nothing — which is exactly what happened: "attempt 1 of 3"
+ * ran the same request at the same cap, twice more. Doubling gives the retry
+ * a reason to succeed.
+ */
+export function widenedLimit(maxTokens: number): number {
+  /**
+   * 16,000 is the ceiling, not 32,000.
+   *
+   * A non-streaming request is refused outright if it MIGHT take longer than
+   * ten minutes, and the API decides that from `max_tokens` before generating
+   * anything — so asking for 32,000 fails instantly with "Streaming is
+   * required", which is a worse outcome than the truncation it was meant to
+   * fix. Verified: 16,000 is accepted on Opus 5, Sonnet 5 and Haiku 4.5.
+   */
+  return Math.min(maxTokens * 2, 16_000);
 }
 
 function assertNotTruncated(
@@ -157,7 +178,45 @@ export interface StructuredCallInput<T> {
  * repair path here — if this ever fails to parse, that is a bug worth seeing
  * rather than papering over.
  */
+/**
+ * Runs a call and, if it ran out of room, runs it once more with twice as
+ * much.
+ *
+ * Wrapping both call paths rather than duplicating the logic in each: a
+ * truncation that recovers on its own never reaches the step runner, so the
+ * pipeline does not stop and nobody sees a token limit in the UI. If the
+ * second attempt also truncates, the error propagates — at that point the step
+ * really is asking for more than it should.
+ */
+async function withTruncationRetry<T>(
+  context: CallContext,
+  maxTokens: number,
+  run: (limit: number) => Promise<CallResult<T>>,
+): Promise<CallResult<T>> {
+  try {
+    return await run(maxTokens);
+  } catch (err) {
+    if (!(err instanceof TruncatedResponseError)) throw err;
+
+    const widened = widenedLimit(maxTokens);
+    if (widened <= maxTokens) throw err;
+
+    console.warn(
+      `[anthropic] ${context.purpose ?? context.step} ran out of room at ` +
+        `${maxTokens.toLocaleString()} tokens; retrying at ${widened.toLocaleString()}.`,
+    );
+
+    return run(widened);
+  }
+}
+
 export async function callStructured<T>(input: StructuredCallInput<T>): Promise<CallResult<T>> {
+  return withTruncationRetry(input.context, input.maxTokens, (limit) =>
+    callStructuredOnce({ ...input, maxTokens: limit }),
+  );
+}
+
+async function callStructuredOnce<T>(input: StructuredCallInput<T>): Promise<CallResult<T>> {
   const { context, model, system, prompt, schema, maxTokens, temperature } = input;
 
   const estimatedInput = estimateInputTokens(system, prompt);
@@ -262,6 +321,12 @@ export interface TextCallInput {
  * separate strict call over the finished body, which is cheap and reliable.
  */
 export async function callText(input: TextCallInput): Promise<CallResult<string>> {
+  return withTruncationRetry(input.context, input.maxTokens, (limit) =>
+    callTextOnce({ ...input, maxTokens: limit }),
+  );
+}
+
+async function callTextOnce(input: TextCallInput): Promise<CallResult<string>> {
   const { context, model, system, prompt, maxTokens, temperature, prefill } = input;
 
   const estimatedInput = estimateInputTokens(system, prompt);

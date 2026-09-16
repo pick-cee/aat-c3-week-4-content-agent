@@ -16,7 +16,8 @@ import type {
  * words.
  */
 
-type Tone = "ok" | "warn" | "danger" | "info" | "accent";
+// Tone lives in db/types so non-component code can use it too.
+import type { Tone } from "@/lib/db/types";
 
 function Pill({ tone, children, title }: { tone: Tone; children: React.ReactNode; title?: string }) {
   return (
@@ -108,6 +109,13 @@ export function requestSortWeight(status: RequestStatus): number {
  */
 const PUBLISH_STATUS: Record<PublishStatus, { label: string; tone: Tone; title: string }> = {
   queued: { label: "Queued", tone: "info", title: "Waiting for its scheduled time." },
+  held: {
+    label: "Waiting for a time",
+    tone: "warn",
+    title:
+      "Approved, but nobody has said when it goes out. It will not send until " +
+      "it is given a time. This is a real row: approved work is never invisible.",
+  },
   publishing: { label: "Sending", tone: "accent", title: "In flight now." },
   published: {
     label: "Published",
@@ -129,14 +137,14 @@ const PUBLISH_STATUS: Record<PublishStatus, { label: string; tone: Tone; title: 
     label: "Posted by hand",
     tone: "ok",
     title:
-      "A person posted this and confirmed with a URL. A real post — and also not something this system did.",
+      "A person posted this and confirmed with a URL. A real post, and also not something this system did.",
   },
   failed: { label: "Failed", tone: "danger", title: "It did not go out." },
   uncertain: {
     label: "Outcome unknown",
     tone: "danger",
     title:
-      "We cannot tell whether this sent. It will NOT be retried automatically — tell us which it was.",
+      "We cannot tell whether this sent. It will NOT be retried automatically, tell us which it was.",
   },
   blocked_not_connected: {
     label: "Not connected",
@@ -193,6 +201,10 @@ export function publishSortWeight(status: PublishStatus): number {
       return 4;
     case "queued":
       return 5;
+    // Above the default, below queued: it needs a decision, but nothing is
+    // wrong with it.
+    case "held":
+      return 4.5;
     default:
       return 6;
   }
@@ -211,7 +223,7 @@ const FETCH_STATUS: Record<FetchStatus, { label: string; tone: Tone; title: stri
   fetch_failed: {
     label: "Could not fetch",
     tone: "danger",
-    title: "The page was never retrieved — a 404, a timeout or a refusal.",
+    title: "The page was never retrieved, a 404, a timeout or a refusal.",
   },
   blocked: { label: "Blocked", tone: "danger", title: "The site refused the request." },
   paywalled: {
@@ -222,7 +234,7 @@ const FETCH_STATUS: Record<FetchStatus, { label: string; tone: Tone; title: stri
   empty: {
     label: "No article text",
     tone: "warn",
-    title: "The page WAS fetched — there was simply nothing on it. Not the same as a failed fetch.",
+    title: "The page WAS fetched, there was simply nothing on it. Not the same as a failed fetch.",
   },
   too_large: {
     label: "Truncated",
@@ -323,7 +335,7 @@ export function Cost({
       title={
         complete
           ? undefined
-          : "At least this much — one or more calls could not be written to the cost log, so the real total may be higher."
+          : "At least this much, one or more calls could not be written to the cost log, so the real total may be higher."
       }
     >
       {complete ? "" : "at least "}

@@ -29,7 +29,7 @@ export async function Landing({ error }: { error?: string }) {
       <p className="landing-lede">
         Submit an idea or a URL. The system researches it, drafts an SEO article grounded in
         excerpts it actually stored, grades its own draft, rewrites what fails, and prepares a
-        LinkedIn post, an X post and a newsletter — with every claim traceable to a source you
+        LinkedIn post, an X post and a newsletter, with every claim traceable to a source you
         can check.
       </p>
 
@@ -49,11 +49,11 @@ export async function Landing({ error }: { error?: string }) {
         />
         <Point
           heading="It grades its own work"
-          body="Source grounding, SEO and the channel rules are measured in code. Only relevance, audience fit, tone and clarity are judged by a model — and a model cannot overrule a failing measurement."
+          body="Source grounding, SEO and the channel rules are measured in code. Only relevance, audience fit, tone and clarity are judged by a model, and a model cannot overrule a failing measurement."
         />
         <Point
           heading="Nothing publishes itself"
-          body="A person approves each channel. LinkedIn and X are handed to someone to post and stay marked as awaiting posting — never as published — until they confirm with a URL."
+          body="A person approves each channel. LinkedIn and X are handed to someone to post and stay marked as awaiting posting, never as published, until they confirm with a URL."
         />
         <Point
           heading="Honest about what it does not know"

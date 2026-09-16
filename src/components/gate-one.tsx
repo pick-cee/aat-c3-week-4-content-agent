@@ -38,6 +38,17 @@ export function GateOne({
   const [replanNote, setReplanNote] = useState("");
   const [showReplan, setShowReplan] = useState(false);
 
+  /**
+   * Which angle is being written, if any.
+   *
+   * A single `pending` flag spun the button on all three cards at once, which
+   * looks like the system is doing three things and is not obviously
+   * recoverable. Tracking WHICH one was chosen lets the others simply
+   * disable — the difference between "this is happening" and "everything is
+   * happening".
+   */
+  const [choosingAngleId, setChoosingAngleId] = useState<string | null>(null);
+
   const usable = sources.filter((s) =>
     ["ok", "too_large", "redirected_offsite"].includes(s.fetch_status),
   );
@@ -119,9 +130,13 @@ export function GateOne({
                     {source.embed_failed && (
                       <span
                         className="pill pill-warn tiny"
-                        title="This source could not be indexed, so it will not be picked automatically. It is still here if you want it."
+                        title={
+                          source.embed_retryable
+                            ? "The indexing service is rate limiting us. This source is queued to be tried again automatically."
+                            : "This source could not be indexed, so it will not be picked automatically. It is still here if you want it."
+                        }
                       >
-                        Not indexed
+                        {source.embed_retryable ? "Indexing, will retry" : "Not indexed"}
                       </span>
                     )}
                   </div>
@@ -201,8 +216,19 @@ export function GateOne({
                   key={angle.id}
                   angle={angle}
                   sources={sources}
-                  pending={pending}
-                  onChoose={() => act(() => chooseAngle(request.id, angle.id))}
+                  chosen={choosingAngleId === angle.id}
+                  // Any click disables the rest; only the chosen one spins.
+                  disabled={pending || choosingAngleId !== null}
+                  onChoose={() => {
+                    setChoosingAngleId(angle.id);
+                    act(async () => {
+                      const result = await chooseAngle(request.id, angle.id);
+                      // Clear only on failure. On success the page navigates,
+                      // and clearing would flash the buttons back to ready.
+                      if (!result.ok) setChoosingAngleId(null);
+                      return result;
+                    });
+                  }}
                 />
               ))}
             </div>
@@ -235,9 +261,9 @@ export function GateOne({
                 value={replanNote}
                 onChange={(e) => setReplanNote(e.target.value)}
                 rows={2}
-                placeholder="These are all too general — I want something about the cost side."
+                placeholder="These are all too general, I want something about the cost side."
               />
-              <div className="row mt-1">
+              <div className="btn-row mt-1">
                 <button
                   className="btn btn-sm btn-primary"
                   disabled={pending || !replanNote.trim()}
@@ -269,7 +295,7 @@ export function GateOne({
             </div>
           ) : (
             <button className="btn btn-sm" onClick={() => setShowReplan(true)} disabled={pending}>
-              None of these — re-plan (about $0.01)
+              None of these, re-plan (about $0.01)
             </button>
           )}
         </div>
@@ -281,12 +307,15 @@ export function GateOne({
 function AngleCard({
   angle,
   sources,
-  pending,
+  chosen,
+  disabled,
   onChoose,
 }: {
   angle: Angle;
   sources: Source[];
-  pending: boolean;
+  /** This is the one being written — only this card shows a spinner. */
+  chosen: boolean;
+  disabled: boolean;
   onChoose: () => void;
 }) {
   const outline = (angle.outline ?? []) as OutlineSection[];
@@ -313,7 +342,7 @@ function AngleCard({
                 <span className="strong" style={{ color: "var(--text)" }}>
                   {section.heading}
                 </span>
-                {section.intent && <span className="dim"> — {section.intent}</span>}
+                {section.intent && <span className="dim">, {section.intent}</span>}
               </li>
             ))}
           </ol>
@@ -336,10 +365,16 @@ function AngleCard({
         <button
           className="btn btn-primary btn-sm"
           onClick={onChoose}
-          disabled={pending}
+          disabled={disabled}
           style={{ flex: "none" }}
         >
-          {pending ? <span className="spin" /> : "Write this one"}
+          {chosen ? (
+            <>
+              <span className="spin" /> Writing…
+            </>
+          ) : (
+            "Write this one"
+          )}
         </button>
       </div>
     </div>

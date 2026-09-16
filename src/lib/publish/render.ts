@@ -39,7 +39,7 @@ export function renderNewsletterHtml(output: ChannelOutput, recipient: Recipient
         <tr><td style="padding:20px 32px 28px;border-top:1px solid #e5e7eb">
           <p style="margin:0;color:#9ca3af;font-size:12px;line-height:1.5">
             You are receiving this because you subscribed to updates from Koya Talent.<br>
-            <a href="${escapeHtml(unsubscribe)}" style="color:#6b7280">Unsubscribe</a> — it takes effect immediately.
+            <a href="${escapeHtml(unsubscribe)}" style="color:#6b7280">Unsubscribe</a>, it takes effect immediately.
           </p>
         </td></tr>
       </table>

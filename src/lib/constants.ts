@@ -49,7 +49,7 @@ export const MODELS = {
 /** USD per search. Counts even when it returns nothing. DESIGN.md §18.1. */
 export const WEB_SEARCH_PRICE_PER_SEARCH = 10 / 1000;
 
-/** voyage-3.5-lite, USD per million tokens. */
+/** text-embedding-3-small, USD per million tokens. Same rate Voyage charged. */
 export const EMBEDDING_PRICE_PER_MTOK = 0.02;
 
 /** Firecrawl, USD per scrape credit. A cached scrape (maxAge) costs nothing. */
@@ -77,9 +77,30 @@ export const BLOCKED_SEARCH_DOMAINS = [
 
 // ─── Embeddings ─────────────────────────────────────────────────────────────
 
-export const EMBEDDING_MODEL = "voyage-3.5-lite";
+/**
+ * OpenAI rather than Voyage. Voyage's free tier rate-limits to a few requests
+ * a minute, which did not fail loudly — it dropped six fetched articles from
+ * the corpus and surfaced three steps later as "the angles are too similar".
+ *
+ * 512 dimensions is unchanged, so the pgvector column and every tuned
+ * similarity threshold (§8.4) carry over. text-embedding-3-small is trained so
+ * a shortened vector remains usable, which is why `dimensions` is a request
+ * parameter rather than a slice of a 1536-wide result.
+ */
+export const EMBEDDING_MODEL = "text-embedding-3-small";
 export const EMBEDDING_DIMENSIONS = 512;
+/** OpenAI accepts up to 2,048 inputs per request; 128 keeps payloads modest. */
 export const EMBEDDING_BATCH_SIZE = 128;
+
+/**
+ * How many times chunk_embed will attempt one source before leaving it out.
+ *
+ * Each attempt already retries internally with a long backoff, so three
+ * attempts spans several rate-limit windows. The cap exists so a provider that
+ * is down for the entire run cannot spend every step invocation on the same
+ * source while the others wait.
+ */
+export const MAX_EMBED_ATTEMPTS = 3;
 
 // ─── Chunking. No model involved. DESIGN.md §5.5. ───────────────────────────
 
@@ -132,6 +153,43 @@ export const PAYWALL_MARKERS = [
   "create an account to continue reading",
 ];
 
+/**
+ * Pages that fetched successfully but are not articles.
+ *
+ * A GitLab sign-in page reached the corpus as a usable source, which left one
+ * real article behind two "sources" and made "each angle must draw on two
+ * distinct sources" unsatisfiable — planning then burned three attempts
+ * failing the same check.
+ *
+ * `empty` catches a page with no text. This catches a page with plenty of
+ * text, none of which is an article: a login wall, a cookie consent screen, a
+ * 404 that returns 200. Matched against the OPENING of the content, where a
+ * real article would already be making its point.
+ */
+export const NOT_AN_ARTICLE_MARKERS = [
+  "sign in to",
+  "sign in ·",
+  "log in to",
+  "create an account",
+  "forgot your password",
+  "enable javascript",
+  "javascript is required",
+  "please enable cookies",
+  "checking your browser",
+  "verify you are human",
+  "access denied",
+  "page not found",
+  "404 not found",
+  "this domain is for use in illustrative examples",
+];
+
+/**
+ * A page shorter than this is treated as not-an-article when it also matches a
+ * marker above. A long page containing "sign in to" is probably an article
+ * that mentions signing in.
+ */
+export const NOT_AN_ARTICLE_MAX_CHARS = 2_500;
+
 // ─── Research selection. DESIGN.md §7.5. ────────────────────────────────────
 
 /** Below this, a source is shown collapsed and unchecked. Never auto-deleted. */
@@ -177,33 +235,39 @@ export const ARTICLE_MAX_WORDS = 2_000;
 /**
  * Output caps per generation step.
  *
- * Sized from what each step actually has to produce, with real headroom. These
- * were previously tight enough that drafting stopped exactly at its cap and
- * stored a half-written article — truncation is now a hard failure
- * (TruncatedResponseError), so a cap that is too low fails loudly instead of
- * silently corrupting the pipeline. Headroom is cheaper than that.
+ * These are a SAFETY RAIL against a runaway generation, not a budget. They are
+ * deliberately far above what each step needs, because the failure they
+ * prevent — a model stopping mid-sentence — is invisible in the output and
+ * expensive to diagnose, while the cost of headroom is zero: you are billed
+ * for tokens produced, never for the cap.
  *
- * A 2,000-word article is roughly 2,700 tokens of prose, plus citation
- * markers, headings and link intents — call it 4,000. 12,000 leaves room for
- * a long piece and for the model to think a little before writing.
+ * Getting this wrong is what produced "the evaluation could not run: the model
+ * hit its 4,000-token limit", a message no content manager should ever see. A
+ * judged rubric with four reasoned criteria and a list of sections to revise
+ * genuinely runs past 4,000 tokens on a long article; the cap was set by
+ * guesswork rather than by what the step has to say.
+ *
+ * Verified against the API: 16,000 is accepted by Opus 5 and Sonnet 5 without
+ * streaming, 8,000 by Haiku 4.5. The real ceiling is the ten-minute
+ * non-streaming limit, not the token count.
  */
 export const MAX_TOKENS = {
-  /** The largest single spend in the pipeline (§18.2). */
-  drafting: 12_000,
-  /** Replacement sections only, not the whole article (§11.3). */
-  revision: 8_000,
-  /** Four criteria with reasons, plus section notes. */
-  evaluation: 4_000,
-  /** Three angles with outlines and rationales. */
-  planning: 4_000,
-  /** One post, plus its declared spans. */
-  adaptation: 2_000,
-  /** Search results as a small JSON list. */
-  discovery: 3_000,
+  /** A 2,000-word article with citation markers is ~4k. This is 4x that. */
+  drafting: 16_000,
+  /** Replacement sections, but a revision can touch most of the article. */
+  revision: 16_000,
+  /** Four criteria with real reasoning, plus every section needing work. */
+  evaluation: 16_000,
+  /** Three angles, each with an outline and a rationale. */
+  planning: 8_000,
+  /** One short post and its declared spans — but a newsletter is 600 words. */
+  adaptation: 8_000,
+  /** Search results as a JSON list, with the model's reasoning about them. */
+  discovery: 8_000,
   /** A title, a meta description and keywords. */
-  articleHeader: 800,
+  articleHeader: 2_000,
   /** One sentence. */
-  altText: 200,
+  altText: 1_000,
 } as const;
 export const META_DESCRIPTION_MAX_CHARS = 160;
 /** SEO: keyword must appear inside this many opening words. */

@@ -62,10 +62,14 @@ async function advanceOnePipeline(): Promise<boolean> {
       p_lease_secs: 5,
     });
 
-    if (!data) return false;
+    // `setof` returns an array; empty means nothing was runnable. The id
+    // check also guards the old scalar shape, where "nothing" arrived as an
+    // object of nulls and passed a plain truthiness test.
+    const row = (Array.isArray(data) ? data[0] : data) as { id?: string } | undefined;
+    if (!row?.id) return false;
 
     const { runStep } = await import("@/lib/pipeline/runner");
-    await runStep((data as { id: string }).id);
+    await runStep(row.id);
     return true;
   } catch {
     return false;

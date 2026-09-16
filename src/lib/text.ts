@@ -215,6 +215,63 @@ export function countXCharacters(text: string): number {
 }
 
 /**
+ * Cuts an X post down to the weighted limit, at a sentence boundary.
+ *
+ * The last resort after the model has been asked twice and still overshot.
+ * Length is the one format rule that can be satisfied exactly in code, so
+ * handing a 326-character post to a person with "cut at least 46 characters"
+ * is asking them to do arithmetic the machine can do perfectly.
+ *
+ * Trims whole sentences from the end, because cutting mid-sentence leaves a
+ * fragment that reads as a bug. If even the first sentence does not fit, falls
+ * back to a word boundary with an ellipsis. Hashtags are never cut — they are
+ * appended after the trim, since a post that loses its tags loses its reach.
+ */
+export function trimXPost(body: string, hashtags: string[] = []): string {
+  const limit = CHANNEL_LIMITS.x.maxChars;
+
+  // Hashtags are reserved out of the budget up front, with a space before each.
+  const tagSuffix = hashtags.length > 0 ? " " + hashtags.join(" ") : "";
+  const bodyWithoutTags = stripTrailingTags(body, hashtags);
+  const budget = limit - countXCharacters(tagSuffix);
+
+  if (countXCharacters(bodyWithoutTags) <= budget) {
+    // Already fits: the overflow was the tags being counted twice.
+    return (bodyWithoutTags.trimEnd() + tagSuffix).trim();
+  }
+
+  const sentences = bodyWithoutTags.match(/[^.!?\n]+[.!?]*\n*/g) ?? [bodyWithoutTags];
+
+  let kept = "";
+  for (const sentence of sentences) {
+    if (countXCharacters(kept + sentence) > budget) break;
+    kept += sentence;
+  }
+
+  if (kept.trim().length === 0) {
+    // Not even one sentence fits. Cut on a word boundary and signal the cut.
+    const words = bodyWithoutTags.split(/\s+/);
+    for (const word of words) {
+      const next = kept ? `${kept} ${word}` : word;
+      if (countXCharacters(`${next}…`) > budget) break;
+      kept = next;
+    }
+    kept = kept ? `${kept}…` : bodyWithoutTags.slice(0, budget);
+  }
+
+  return (kept.trimEnd() + tagSuffix).trim();
+}
+
+/** Removes hashtags already present at the end, so they are not duplicated. */
+function stripTrailingTags(body: string, hashtags: string[]): string {
+  let out = body.trimEnd();
+  for (const tag of [...hashtags].reverse()) {
+    if (out.endsWith(tag)) out = out.slice(0, -tag.length).trimEnd();
+  }
+  return out;
+}
+
+/**
  * Twitter's weighted counting: characters outside the Latin/General
  * Punctuation ranges count 2. Iterating code points (not UTF-16 units) is what
  * makes an emoji weigh 2 rather than its surrogate pair weighing 2 each.

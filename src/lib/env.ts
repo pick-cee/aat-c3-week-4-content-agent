@@ -18,7 +18,7 @@ export class MissingEnvError extends Error {
   constructor(public readonly key: string) {
     super(
       `Missing required environment variable ${key}. ` +
-        `Add it to .env — see .env.example for what it is and where to get it.`,
+        `Add it to .env, see .env.example for what it is and where to get it.`,
     );
     this.name = "MissingEnvError";
   }
@@ -84,12 +84,18 @@ export const env = {
     },
   },
 
-  voyage: {
+  /**
+   * Embeddings. OpenAI rather than Voyage: Voyage's free tier rate-limits to a
+   * few requests a minute, which silently starved the corpus rather than
+   * failing outright. Only the provider changed — the grounding check in §8.4
+   * and the retrieval it feeds are unchanged.
+   */
+  embeddings: {
     get apiKey() {
-      return required("VOYAGE_API_KEY");
+      return required("OPENAI_API_KEY");
     },
     get configured() {
-      return Boolean(optional("VOYAGE_API_KEY"));
+      return Boolean(optional("OPENAI_API_KEY"));
     },
   },
 
@@ -179,7 +185,7 @@ export const env = {
 export function integrationStatus() {
   return {
     firecrawl: env.firecrawl.configured,
-    voyage: env.voyage.configured,
+    embeddings: env.embeddings.configured,
     resend: env.resend.configured,
     openverse: true, // Works anonymously, at a lower rate limit.
     demoMode: env.app.demoMode,

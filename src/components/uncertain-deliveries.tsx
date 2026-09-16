@@ -45,7 +45,7 @@ export async function UncertainDeliveries({ requestId }: { requestId?: string })
       <div className="card-pad">
         <p className="small muted">
           The provider never confirmed these. They may have arrived or they may not, so the
-          system will not re-send them — doing that is how one person receives the same message
+          system will not re-send them, doing that is how one person receives the same message
           twice. Check the provider by message id, or ask the recipient.
         </p>
 

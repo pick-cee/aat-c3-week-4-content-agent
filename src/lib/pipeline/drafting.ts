@@ -2,7 +2,7 @@ import "server-only";
 import { serviceClient, table } from "@/lib/db/client";
 import { logInfo, logWarn } from "@/lib/log";
 import { callStructured, callText, recordDiscarded } from "@/lib/providers/anthropic";
-import { embed, toVectorLiteral } from "@/lib/providers/voyage";
+import { embed, toVectorLiteral } from "@/lib/providers/embeddings";
 import {
   buildClaimMap,
   checkMarkerIntegrity,
@@ -16,6 +16,7 @@ import {
   CITATION_BLOCK,
   LINKING_BLOCK,
   SEO_RULES_BLOCK,
+  PUNCTUATION_BLOCK,
 } from "./prompts";
 import {
   MAX_TOKENS,
@@ -25,6 +26,7 @@ import {
   META_DESCRIPTION_MAX_CHARS,
 } from "@/lib/constants";
 import { countWords, parseHeadings, slugify } from "@/lib/text";
+import { countEmDashes, replaceEmDashes } from "./checks";
 import type {
   Angle,
   ArticleVersion,
@@ -198,7 +200,7 @@ export async function draftArticle(
       text:
         "You write publication-quality articles for a marketing agency. The material you " +
         "are given has already been researched, fetched and approved by a human. You write " +
-        "from it and from nothing else — you have no web access and no memory of this topic " +
+        "from it and from nothing else, you have no web access and no memory of this topic " +
         "that you may treat as fact.\n\n" +
         "Write markdown. Do not wrap the article in a code fence.",
       cache: true,
@@ -207,6 +209,7 @@ export async function draftArticle(
     { text: CITATION_BLOCK, cache: true },
     { text: LINKING_BLOCK, cache: true },
     ...(voice ? [{ text: brandVoiceBlock(voice), cache: true }] : []),
+    { text: PUNCTUATION_BLOCK, cache: true },
   ];
 
   const basePrompt = buildDraftPrompt(request, angle, excerpts);
@@ -322,7 +325,7 @@ function buildDraftPrompt(
     `Target audience: ${request.target_audience}`,
     `The original idea: ${request.idea}`,
     ``,
-    `Outline — write every one of these as an H2 section, in this order:`,
+    `Outline, write every one of these as an H2 section, in this order:`,
     outline.map((s, i) => `${i + 1}. ${s.heading}\n   Purpose: ${s.intent}`).join("\n"),
     ``,
     `── Source excerpts ──`,
@@ -466,6 +469,35 @@ export interface SaveVersionInput {
 export async function saveVersion(input: SaveVersionInput): Promise<ArticleVersion> {
   const db = serviceClient();
 
+  /**
+   * Em dashes are removed here, at the one door every article version passes
+   * through — first draft, revision and human edit alike.
+   *
+   * The prompt forbids them (PUNCTUATION_BLOCK) but a model complies with that
+   * unreliably, and rejecting a whole draft over punctuation would spend a
+   * redraft on something with an exact mechanical fix. The instruction is
+   * still measured: `emDashesRemoved` records how many got through, so
+   * "the prompt is working" is a number rather than a hope.
+   *
+   * Markers are untouched: the substitution only ever replaces a dash with a
+   * comma, and never moves text across sentence boundaries.
+   */
+  const emDashesRemoved =
+    countEmDashes(input.title) +
+    countEmDashes(input.metaDescription ?? "") +
+    countEmDashes(input.body);
+
+  const title = replaceEmDashes(input.title);
+  const metaDescription = input.metaDescription ? replaceEmDashes(input.metaDescription) : null;
+  const body = replaceEmDashes(input.body);
+
+  if (emDashesRemoved > 0) {
+    await logInfo(
+      `Removed ${emDashesRemoved} em dash${emDashesRemoved === 1 ? "" : "es"} from the draft.`,
+      { requestId: input.request.id, step: "draft", detail: { emDashesRemoved } },
+    );
+  }
+
   const { data: latest } = await db
     .from(table("article_versions"))
     .select("version")
@@ -476,7 +508,7 @@ export async function saveVersion(input: SaveVersionInput): Promise<ArticleVersi
 
   const version = ((latest?.version as number | undefined) ?? 0) + 1;
 
-  const headings: HeadingNode[] = parseHeadings(input.body).map((h) => ({
+  const headings: HeadingNode[] = parseHeadings(body).map((h) => ({
     level: h.level,
     text: h.text,
   }));
@@ -487,12 +519,12 @@ export async function saveVersion(input: SaveVersionInput): Promise<ArticleVersi
       request_id: input.request.id,
       version,
       angle_id: input.angle?.id ?? null,
-      title: input.title,
-      meta_description: input.metaDescription,
-      body_md: input.body,
+      title,
+      meta_description: metaDescription,
+      body_md: body,
       primary_keyword: input.primaryKeyword,
       secondary_keywords: input.secondaryKeywords,
-      word_count: countWords(input.body),
+      word_count: countWords(body),
       headings: headings as unknown as HeadingNode[],
       claim_map: input.claimMap as never,
       link_targets: input.linkTargets as never,
@@ -510,7 +542,7 @@ export async function saveVersion(input: SaveVersionInput): Promise<ArticleVersi
 
   // The permalink is generated once and is stable thereafter (§10.1).
   if (!input.request.slug) {
-    await assignSlug(input.request.id, input.title);
+    await assignSlug(input.request.id, title);
   }
 
   return data as unknown as ArticleVersion;

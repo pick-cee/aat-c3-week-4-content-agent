@@ -15,14 +15,28 @@ import type { ActivityLogEntry } from "@/lib/db/types";
 export function ActivityFeed({ entries }: { entries: ActivityLogEntry[] }) {
   if (entries.length === 0) return null;
 
+  // Entries arrive newest first (the query orders by created_at desc).
+  const latest = entries[0];
+
   return (
-    <details className="card mt-3">
+    <details className="card mb-3">
       <summary
         className="card-head"
         style={{ cursor: "pointer", listStyle: "none", borderBottom: "none" }}
       >
-        <h2 style={{ fontSize: 14 }}>Activity</h2>
-        <span className="tiny dim">{entries.length} entries</span>
+        <div className="min-w-0">
+          <h2 style={{ fontSize: 14 }}>Activity</h2>
+          {/* The latest event, without opening anything. Collapsed behind a
+              summary at the bottom of a long page, this log was effectively
+              invisible, a founder had no idea it existed, let alone that it
+              answers "what just happened". */}
+          {latest && (
+            <div className="tiny dim truncate-2" style={{ marginTop: 2 }}>
+              {latest.message}
+            </div>
+          )}
+        </div>
+        <span className="tiny dim nowrap">{entries.length} entries</span>
       </summary>
 
       <div style={{ borderTop: "1px solid var(--border)" }}>

@@ -14,4 +14,9 @@ export async function runStartup(): Promise<void> {
 
   await ensureSchema();
   await seedIfEmpty();
+
+  // The queue keeps its own schedule from here: a send time is a promise the
+  // app has to keep whether or not anyone has a page open.
+  const { startScheduler } = await import("../publish/scheduler");
+  startScheduler();
 }

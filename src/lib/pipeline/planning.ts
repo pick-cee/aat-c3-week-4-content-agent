@@ -6,7 +6,7 @@ import {
   recordDiscarded,
   type CallResult,
 } from "@/lib/providers/anthropic";
-import { embed, cosineSimilarity } from "@/lib/providers/voyage";
+import { embed, cosineSimilarity } from "@/lib/providers/embeddings";
 import { containsKeyword } from "@/lib/text";
 import {
   MAX_TOKENS,
@@ -18,7 +18,7 @@ import {
   MIN_SOURCES_PER_ANGLE,
 } from "@/lib/constants";
 import type { BrandVoice, ContentRequest, OutlineSection } from "@/lib/db/types";
-import { brandVoiceBlock } from "./prompts";
+import { brandVoiceBlock, PUNCTUATION_BLOCK } from "./prompts";
 
 /**
  * Angle planning. DESIGN.md §9, §2.2.
@@ -124,6 +124,19 @@ export interface PlanResult {
 }
 
 /**
+ * A broken constraint, and whether asking again could fix it.
+ *
+ * The distinction is what stops the pipeline burning three planning calls on
+ * a request that cannot succeed. "Your headline is missing its keyword" is a
+ * rewrite away; "each angle must use two sources" is unanswerable when only
+ * one source exists, and retrying it spends money to be told the same thing.
+ */
+interface Violation {
+  message: string;
+  fixable: boolean;
+}
+
+/**
  * Produces exactly three angles and checks the §9 constraints IN CODE rather
  * than asking for them politely.
  *
@@ -146,13 +159,13 @@ export async function planAngles(
         "audience, and a digest of source material that has already been read and approved.\n\n" +
         `Produce exactly ${ANGLE_COUNT} genuinely DIFFERENT directions the article could take.\n\n` +
         "This is the part people get wrong. Three restatements of one idea is not a " +
-        "choice, and it is checked mechanically — the angles are embedded and compared, " +
+        "choice, and it is checked mechanically, the angles are embedded and compared, " +
         "and a set that is too similar is sent back.\n\n" +
         "Make them differ in KIND, not in wording. Across the three, vary:\n" +
-        "  · who the reader is — a sceptic, a beginner, someone already sold\n" +
-        "  · the shape — a how-to, a myth corrected, a comparison, a cost case,\n" +
+        "  · who the reader is, a sceptic, a beginner, someone already sold\n" +
+        "  · the shape, a how-to, a myth corrected, a comparison, a cost case,\n" +
         "    a what-goes-wrong piece\n" +
-        "  · what it argues — they should be capable of disagreeing with each other\n\n" +
+        "  · what it argues, they should be capable of disagreeing with each other\n\n" +
         "A useful test: if two of your headlines could sit under the same subheading " +
         "of a single article, they are too close.\n\n" +
         "Hard rules:\n" +
@@ -164,6 +177,7 @@ export async function planAngles(
       cache: true,
     },
     ...(voice ? [{ text: brandVoiceBlock(voice), cache: true }] : []),
+    { text: PUNCTUATION_BLOCK, cache: true },
   ];
 
   const prompt = buildPlanPrompt(request, digest, replanNote);
@@ -181,6 +195,8 @@ export async function planAngles(
   let lastViolations: string[] = [];
   // The attempt just rejected, which is what the retry note quotes back.
   let previousAttempt: AngleSet | null = null;
+  // Built from the FIXABLE violations only; empty on the first attempt.
+  let retryNote = "";
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     // Annotated explicitly: `result` feeds `lastResult`, which feeds
@@ -190,7 +206,7 @@ export async function planAngles(
       context,
       model: MODELS.planning,
       system,
-      prompt: attempt === 0 ? prompt : `${prompt}\n\n${buildRetryNote(lastViolations, previousAttempt)}`,
+      prompt: attempt === 0 ? prompt : `${prompt}\n\n${retryNote}`,
       schema: ANGLE_SCHEMA,
       maxTokens: MAX_TOKENS.planning,
       temperature: 1,
@@ -202,23 +218,55 @@ export async function planAngles(
       return { angles: result.value.angles, warnings: [] };
     }
 
+    /**
+     * Only retry what a retry can fix.
+     *
+     * The waste this prevents: with two sources — one of them a sign-in page —
+     * "each angle must draw on two distinct sources" cannot be satisfied by
+     * any wording, so all three attempts failed the same check and burned
+     * three planning calls to arrive where the first one did.
+     *
+     * A violation the model cannot act on is a fact about the RESEARCH, not
+     * about the angles. Surface it once and stop.
+     */
+    const fixable = violations.filter((v) => v.fixable);
+
+    if (fixable.length === 0) {
+      await logWarn(
+        "The angles are as distinct as the available sources allow. They are shown so you can " +
+          "choose, or add sources and re-plan.",
+        {
+          requestId: request.id,
+          step: "plan",
+          detail: { violations: violations.map((v) => v.message) },
+        },
+      );
+      return {
+        angles: result.value.angles,
+        warnings: violations.map((v) => v.message),
+      };
+    }
+
     // Keep the BEST attempt, not the most recent one. A later try can come
     // back worse, and handing the reviewer the worst of three because it
     // happened to be last would be a strange way to end.
     if (lastResult === null || violations.length < lastViolations.length) {
       lastResult = result.value;
-      lastViolations = violations;
+      lastViolations = violations.map((v) => v.message);
     }
 
     // The retry prompt needs the attempt that was just rejected, whichever
-    // one is being kept.
+    // one is being kept, and only the parts it can actually act on.
     previousAttempt = result.value;
+    // Only the fixable ones go into the retry note: telling the model to use
+    // two sources when two do not exist is asking it to fail again.
+    retryNote = buildRetryNote(fixable.map((v) => v.message), previousAttempt);
 
     await recordDiscarded(
       context,
       MODELS.planning,
       result.usage,
-      `Angle constraints violated: ${violations.join("; ")}`,
+      `Angle constraints violated: ${fixable.map((v) => v.message).join("; ")}`,
     );
   }
 
@@ -260,13 +308,13 @@ function buildRetryNote(
       "You proposed these, and they are variations of one idea:",
       previous.angles.map((a, i) => `  ${i + 1}. "${a.headline}"`).join("\n"),
       "",
-      "Start over. Do not rephrase these — write three angles that a reader",
+      "Start over. Do not rephrase these, write three angles that a reader",
       "would recognise as DIFFERENT ARTICLES. Vary at least these:",
       "",
-      "  · WHO it is for — a sceptic, a beginner, someone already convinced",
-      "  · WHAT SHAPE it takes — a how-to, a myth-corrected, a comparison,",
+      "  · WHO it is for, a sceptic, a beginner, someone already convinced",
+      "  · WHAT SHAPE it takes, a how-to, a myth-corrected, a comparison,",
       "    a cost argument, a case-led piece, a common-mistakes piece",
-      "  · WHAT IT ARGUES — the angles should be able to disagree with each",
+      "  · WHAT IT ARGUES, the angles should be able to disagree with each",
       "    other, not merely emphasise different nouns",
       "",
       "If two of your new headlines could sit under the same subheading of one",
@@ -288,16 +336,17 @@ async function checkAngleConstraints(
   angles: PlannedAngle[],
   digest: SourceDigestEntry[],
   request: ContentRequest,
-): Promise<string[]> {
-  const violations: string[] = [];
+): Promise<Violation[]> {
+  const violations: Violation[] = [];
 
   // Counts the schema used to guarantee. Structured outputs reject array
   // length constraints, so if these are not checked here they are not checked
   // at all — and "three angles" would quietly become however many arrived.
   if (angles.length !== ANGLE_COUNT) {
-    violations.push(
-      `You returned ${angles.length} angle(s); exactly ${ANGLE_COUNT} are required.`,
-    );
+    violations.push({
+      message: `You returned ${angles.length} angle(s); exactly ${ANGLE_COUNT} are required.`,
+      fixable: true,
+    });
   }
 
   const labelToSource = new Map<string, string>();
@@ -308,15 +357,17 @@ async function checkAngleConstraints(
   angles.forEach((angle, i) => {
     const sections = angle.outline?.length ?? 0;
     if (sections < ANGLE_OUTLINE_MIN_SECTIONS || sections > ANGLE_OUTLINE_MAX_SECTIONS) {
-      violations.push(
-        `Angle ${i + 1} has ${sections} outline section(s); the rule is ${ANGLE_OUTLINE_MIN_SECTIONS} to ${ANGLE_OUTLINE_MAX_SECTIONS}.`,
-      );
+      violations.push({
+        message: `Angle ${i + 1} has ${sections} outline section(s); the rule is ${ANGLE_OUTLINE_MIN_SECTIONS} to ${ANGLE_OUTLINE_MAX_SECTIONS}.`,
+        fixable: true,
+      });
     }
 
     if (!containsKeyword(angle.headline, angle.primaryKeyword)) {
-      violations.push(
-        `Angle ${i + 1} headline "${angle.headline}" does not contain its primary keyword "${angle.primaryKeyword}".`,
-      );
+      violations.push({
+        message: `Angle ${i + 1} headline "${angle.headline}" does not contain its primary keyword "${angle.primaryKeyword}".`,
+        fixable: true,
+      });
     }
 
     /**
@@ -333,16 +384,21 @@ async function checkAngleConstraints(
       (angle.excerptLabels ?? []).map((l) => labelToSource.get(l)).filter(Boolean),
     );
     if (sources.size < requiredSources) {
-      violations.push(
-        `Angle ${i + 1} draws on ${sources.size} source(s); it must use at least ${requiredSources}.`,
-      );
+      violations.push({
+        message: `Angle ${i + 1} draws on ${sources.size} source(s); it must use at least ${requiredSources}.`,
+        // Fixable only if there is somewhere else to draw from. With one
+        // usable source no rewrite can satisfy this, and retrying spends
+        // money to be told the same thing.
+        fixable: digest.length > sources.size,
+      });
     }
 
     const unknown = (angle.excerptLabels ?? []).filter((l) => !labelToSource.has(l));
     if (unknown.length > 0) {
-      violations.push(
-        `Angle ${i + 1} references ${unknown.join(", ")}, which are not in the digest.`,
-      );
+      violations.push({
+        message: `Angle ${i + 1} references ${unknown.join(", ")}, which are not in the digest.`,
+        fixable: true,
+      });
     }
   });
 
@@ -364,9 +420,13 @@ async function checkAngleConstraints(
         if (!a || !b) continue;
         const similarity = cosineSimilarity(a, b);
         if (similarity > MAX_ANGLE_OVERLAP) {
-          violations.push(
-            `Angles ${i + 1} and ${j + 1} are ${Math.round(similarity * 100)}% similar; they must differ by more than that to be a real choice.`,
-          );
+          violations.push({
+            message: `Angles ${i + 1} and ${j + 1} are ${Math.round(similarity * 100)}% similar; they must differ by more than that to be a real choice.`,
+            // Three genuinely different angles need material to differ ABOUT.
+            // Off a single source they will always read alike, and asking
+            // again just pays for the same answer.
+            fixable: digest.length >= MIN_SOURCES_PER_ANGLE,
+          });
         }
       }
     }
@@ -390,14 +450,14 @@ function buildPlanPrompt(
   if (request.primary_keyword) {
     parts.push(`Primary keyword (use this): ${request.primary_keyword}`);
   } else {
-    parts.push("Primary keyword: not specified — propose one per angle.");
+    parts.push("Primary keyword: not specified, propose one per angle.");
   }
 
   parts.push("\n── Source digest ──\n");
 
   for (const entry of digest) {
     parts.push(
-      `${entry.sourceLabel} — "${entry.title}" (${entry.siteName})\n` +
+      `${entry.sourceLabel}, "${entry.title}" (${entry.siteName})\n` +
         `  ${entry.summary}\n` +
         entry.snippets.map((s) => `  [${s.label}] ${s.text}`).join("\n"),
     );

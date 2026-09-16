@@ -20,6 +20,14 @@ If anything looks wrong, `/api/health` reports the state of Postgres, each
 provider and each connector, so a dead dependency is diagnosable without
 reading logs.
 
+**On embeddings.** They are not optional garnish: they rank sources, choose what
+goes into the drafting call, and back the weak-citation check that makes a
+citation on an unrelated claim detectable (DESIGN.md §8.4). `OPENAI_API_KEY` is
+therefore required, and it needs billing enabled — the whole corpus for a
+request costs a fraction of a cent, but a free tier's per-minute limit silently
+drops sources from the research instead of failing loudly. Changing embedding
+provider invalidates every stored vector, so the two must never be mixed.
+
 ## The documents
 
 - `PRD.md` — the brief
@@ -42,9 +50,9 @@ documents still describe a WhatsApp broadcast, the code is right.
 | `npm run dev` | Start the app. Migrations and seed run automatically. |
 | `npm run build` | Production build, including a full typecheck. |
 | `npm run typecheck` | Types only. |
-| `npm test` | 107 unit tests. |
+| `npm test` | 188 unit tests. |
 | `npm run broken-pack` | The deliberately broken input pack (DESIGN.md §21.1). |
-| `npm run db:push` | Apply migrations by hand. |
+| `npm run db:push` | Apply migrations by hand. Shares its ledger and advisory lock with the startup runner, so the two cannot disagree about what is applied. |
 | `npm run db:seed` | Apply migrations and seed the demo account, brand voice, connectors and recipients. Idempotent. |
 
 ### The verification scripts
@@ -73,3 +81,17 @@ And it is honest about what it does not know. A source that failed to fetch is
 distinct from one that was empty. A send whose outcome nobody can account for
 is `uncertain`, never retried automatically, and counted separately from a
 failure. A count that could not be read shows a dash, not a zero.
+
+The same distinction applies to indexing. A source the embedding service merely
+rate-limited is retried automatically and says so; one that genuinely cannot be
+indexed is marked and left for manual inclusion. Collapsing those two into a
+single "failed" flag once discarded six good articles and surfaced, three steps
+later, as a complaint that the angles looked too similar — so the difference is
+recorded in the table, not inferred.
+
+It also never claims to be retrying when it is not. The word "retrying" appears
+only when another attempt is genuinely scheduled, with the attempt number shown;
+a failure that cannot succeed on a second try — a budget that has run out, for
+instance — stops immediately and says what it needs and who can supply it. A
+spinner that never resolves is worse than an error, because an error can be
+acted on.

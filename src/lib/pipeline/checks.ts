@@ -80,7 +80,22 @@ export function runSeoChecks(input: SeoCheckInput): SeoCheckResult {
   const h1s = headings.filter((h) => h.level === 1);
   const h2s = headings.filter((h) => h.level === 2);
   const paragraphs = parseParagraphs(bodyMd);
-  const links = extractMarkdownLinks(bodyMd);
+  /**
+   * Links exist as MARKERS at evaluation time, not as markdown.
+   *
+   * The model is forbidden from writing a URL (rule 3): it writes
+   * `((link: anchor | E12))` and the server substitutes the real URL at
+   * publish. Counting only `[text](url)` therefore reported zero links on an
+   * article that had three, and the SEO check failed a draft that could never
+   * satisfy it, because satisfying it would have meant breaking rule 3.
+   *
+   * One request spent every revision round on this, each rewrite dropping more
+   * of the article while the count stayed at zero.
+   */
+  const markerLinks = [...bodyMd.matchAll(/\(\(link:\s*([^|)]+)\|\s*(E\d+)\s*\)\)/g)].map(
+    (m) => ({ text: m[1]!.trim(), url: `marker:${m[2]}` }),
+  );
+  const links = [...extractMarkdownLinks(bodyMd), ...markerLinks];
   const wordCount = countWords(bodyMd);
 
   const keywordInTitle = containsKeyword(title, primaryKeyword);
@@ -93,7 +108,12 @@ export function runSeoChecks(input: SeoCheckInput): SeoCheckResult {
   // URL (rule 3), so a link outside this set means substitution failed —
   // which is a bug worth surfacing, not a style note.
   const allowed = new Set(allowedUrls);
-  const unresolved = links.filter((l) => !allowed.has(l.url) && !l.url.startsWith("/"));
+  // A `marker:` link resolves by construction: the server substitutes the URL
+  // from the excerpt's own source, so there is no URL here to be wrong yet.
+  // Marker integrity is checked separately and is a hard failure there.
+  const unresolved = links.filter(
+    (l) => !allowed.has(l.url) && !l.url.startsWith("/") && !l.url.startsWith("marker:"),
+  );
   const linksResolve = unresolved.length === 0;
 
   const longParagraphs = paragraphs.filter(
@@ -212,6 +232,47 @@ function overlapRatio(a: string, b: string): number {
 export function findBannedPhrases(text: string, banned: string[]): string[] {
   const haystack = text.toLowerCase();
   return banned.filter((phrase) => haystack.includes(phrase.toLowerCase()));
+}
+
+/**
+ * Em dashes and their close relatives.
+ *
+ * The single clearest tell that a machine wrote the text, and asking the model
+ * not to use them does not work reliably — so it is measured and repaired in
+ * code rather than trusted (rule 2: verify the instruction, do not trust it).
+ *
+ * The en dash is included when it separates words; between digits it is a
+ * legitimate range ("2020–2024") and is left alone.
+ */
+const EM_DASH_PATTERN = /\s*—\s*|\s*―\s*|(?<=\D)\s*–\s*(?=\D)/g;
+
+export function countEmDashes(text: string): number {
+  return (text.match(EM_DASH_PATTERN) ?? []).length;
+}
+
+/**
+ * Rewrites em dashes into ordinary punctuation.
+ *
+ * A dash joining two clauses becomes a comma, which reads naturally in almost
+ * every case. A dash at the end of a clause (before a closing bracket, or at
+ * the end of a line) is simply removed along with its surrounding space.
+ */
+export function replaceEmDashes(text: string): string {
+  return text
+    // A dash that already runs into punctuation contributes nothing and would
+    // otherwise become ", ," or ", ." — drop it and keep the punctuation.
+    .replace(/\s*[—―]\s*(?=[.,;:!?])/g, "")
+    // A parenthetical pair "word — aside — word" reads correctly with commas.
+    .replace(/\s+—\s+/g, ", ")
+    .replace(/\s+―\s+/g, ", ")
+    .replace(/(?<=\D)\s+–\s+(?=\D)/g, ", ")
+    // No surrounding spaces: "word—word" becomes "word, word".
+    .replace(/(\S)—(\S)/g, "$1, $2")
+    .replace(/(\S)―(\S)/g, "$1, $2")
+    .replace(/(?<=\D)–(?=\D)/g, ", ")
+    // A dash left touching punctuation would produce ", ." or ", ,".
+    .replace(/,\s*([.,;:!?])/g, "$1")
+    .replace(/,\s*,/g, ",");
 }
 
 // ─── Channel format checks (§12.1) ──────────────────────────────────────────
@@ -337,7 +398,7 @@ export function checkX(input: XCheckInput): FormatCheckResult {
         ? `Post weighs ${weighted} of ${limits.maxChars} characters.`
         : // Naming the OVERSHOOT, not just the total: "cut at least 40
           // characters" converges in one attempt where "it is 320" does not.
-          `Post weighs ${weighted} characters and the limit is ${limits.maxChars} — ` +
+          `Post weighs ${weighted} characters and the limit is ${limits.maxChars}, ` +
           `cut at least ${weighted - limits.maxChars} characters. ` +
           `(Raw length ${body.length}; any URL counts as ${limits.urlWeight} however long it is.)`,
     ),

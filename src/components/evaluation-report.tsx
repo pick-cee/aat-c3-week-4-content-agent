@@ -19,6 +19,34 @@ const CRITERION_LABELS: Record<string, string> = {
   clarity: "Clarity",
 };
 
+/**
+ * What the verdict means, in a sentence a person can act on.
+ *
+ * `pass` / `revise` / `reject` are the database's words. A reviewer wants to
+ * know whether they can send it, so the headline answers that and the detail
+ * says what follows.
+ */
+const VERDICT: Record<string, { headline: string; detail: string }> = {
+  pass: {
+    headline: "Ready to send",
+    detail:
+      "Every computed check passed and the judged scores are sound. Read it if you want to, " +
+      "then approve the channels you want it on.",
+  },
+  revise: {
+    headline: "Needs work before it goes out",
+    detail:
+      "Something below did not meet the bar. You can still approve it if you disagree, or " +
+      "send it back with a note saying what to change.",
+  },
+  reject: {
+    headline: "Not usable as written",
+    detail:
+      "This failed badly enough that editing it is likely to cost more than rewriting. The " +
+      "detail below says what went wrong.",
+  },
+};
+
 export function EvaluationReport({ evaluation }: { evaluation: Evaluation | null }) {
   if (!evaluation) {
     return <p className="small muted">This version has not been evaluated.</p>;
@@ -29,31 +57,35 @@ export function EvaluationReport({ evaluation }: { evaluation: Evaluation | null
       <div className="alert alert-warn small mb-0">
         <strong>The evaluation could not run.</strong>
         <p className="mb-0 mt-1">
-          {evaluation.error ?? "No reason was recorded."} This is not a pass — an evaluation that
+          {evaluation.error ?? "No reason was recorded."} This is not a pass, an evaluation that
           did not happen can never become one, so the draft was not approved on its behalf.
         </p>
       </div>
     );
   }
 
+  // `not_evaluated` returned above, so the remaining three are all mapped.
+  const verdict = VERDICT[evaluation.status] ?? VERDICT.revise!;
   const computed = evaluation.computed;
   const judged = evaluation.judged as Record<string, JudgedCriterion> | null;
 
   return (
     <div className="stack" style={{ gap: 14 }}>
-      <div className="row-between">
-        <span className="strong small">Overall</span>
-        <span
-          className={`pill ${
-            evaluation.status === "pass"
-              ? "pill-ok"
-              : evaluation.status === "reject"
-                ? "pill-danger"
-                : "pill-warn"
-          }`}
-        >
-          {evaluation.status}
-        </span>
+      {/* The verdict in a sentence, before any detail.
+          "revise" is the database's word for it; a reviewer wants to know
+          whether they can send this and what stands in the way. The scores
+          below are how they check that answer, not how they find it. */}
+      <div
+        className={`alert small mb-0 ${
+          evaluation.status === "pass"
+            ? "alert-ok"
+            : evaluation.status === "reject"
+              ? "alert-error"
+              : "alert-warn"
+        }`}
+      >
+        <strong>{verdict.headline}</strong>
+        <p className="mb-0 mt-1">{verdict.detail}</p>
       </div>
 
       {/* The judge's verdict is stored and displayed, but it does not decide.
@@ -62,7 +94,7 @@ export function EvaluationReport({ evaluation }: { evaluation: Evaluation | null
       {evaluation.judge_overruled && (
         <div className="alert alert-warn small mb-0">
           The reviewing model said <strong>{evaluation.judge_verdict}</strong>, but a measured
-          check is failing. The measurement stands — a model does not get to overrule a fact.
+          check is failing. The measurement stands, a model does not get to overrule a fact.
         </div>
       )}
 
@@ -160,14 +192,16 @@ export function EvaluationReport({ evaluation }: { evaluation: Evaluation | null
             Claims with no support
           </h4>
           <div className="stack" style={{ gap: 6 }}>
+            {/* The whole sentence, never a slice. This is the evidence the
+                reviewer has to judge, a claim cut off at "round three is a c…"
+                cannot be checked, which defeats the point of listing it. */}
             {evaluation.unsupported_claims!.slice(0, 8).map((claim, i) => (
-              <div key={i} className="tiny" style={{ color: "var(--text-2)" }}>
-                &ldquo;{claim.sentence.slice(0, 160)}
-                {claim.sentence.length > 160 && "…"}&rdquo;
+              <blockquote key={i} className="claim-quote">
+                {claim.sentence}
                 {claim.labels.length > 0 && (
-                  <span className="dim"> — cites {claim.labels.join(", ")}</span>
+                  <span className="dim">, cites {claim.labels.join(", ")}</span>
                 )}
-              </div>
+              </blockquote>
             ))}
           </div>
         </section>
@@ -183,22 +217,28 @@ export function EvaluationReport({ evaluation }: { evaluation: Evaluation | null
           </p>
           <div className="stack" style={{ gap: 6 }}>
             {evaluation.weak_citations!.slice(0, 6).map((claim, i) => (
-              <div key={i} className="tiny" style={{ color: "var(--text-2)" }}>
-                &ldquo;{claim.sentence.slice(0, 140)}
-                {claim.sentence.length > 140 && "…"}&rdquo;
+              <blockquote key={i} className="claim-quote">
+                {claim.sentence}
                 {claim.groundingScore != null && (
-                  <span className="dim"> — {(claim.groundingScore * 100).toFixed(0)}% match</span>
+                  <span className="dim">, {(claim.groundingScore * 100).toFixed(0)}% match</span>
                 )}
-              </div>
+              </blockquote>
             ))}
           </div>
         </section>
       )}
 
-      {evaluation.recommended_changes && (
+      {(evaluation.recommended_changes?.length ?? 0) > 0 && (
         <section>
           <h4 className="tiny strong mb-1">Recommended changes</h4>
-          <p className="tiny muted mb-0">{evaluation.recommended_changes}</p>
+          {/* A numbered list, most important first. This was one dense
+              paragraph of nine edits run together, which had to be unpicked
+              before any of it could be acted on. */}
+          <ol className="change-list">
+            {evaluation.recommended_changes!.map((change, i) => (
+              <li key={i}>{change}</li>
+            ))}
+          </ol>
         </section>
       )}
 

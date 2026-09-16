@@ -26,7 +26,7 @@ export function ConfirmForm({
       setTimeout(() => setCopied(false), 2_000);
     } catch {
       // Clipboard access can be refused; the text is selectable either way.
-      setError("Could not copy automatically — select the text above and copy it.");
+      setError("Could not copy automatically, select the text above and copy it.");
     }
   }
 
@@ -59,7 +59,7 @@ export function ConfirmForm({
         />
         <div className="hint">
           This is what moves it from awaiting posting to posted. Without it, the queue keeps
-          showing that nobody has posted yet — which is the truth until you do.
+          showing that nobody has posted yet, which is the truth until you do.
         </div>
       </div>
 

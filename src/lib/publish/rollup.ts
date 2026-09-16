@@ -77,7 +77,7 @@ export function rollUpDeliveries(tally: DeliveryTally, isDryRun: boolean): RollU
     status: "partially_delivered",
     message:
       uncertain > 0
-        ? `${counts}. The unknown ones will not be retried automatically — ` +
+        ? `${counts}. The unknown ones will not be retried automatically, ` +
           `re-sending a delivery that may already have arrived is how someone ` +
           `receives the same message twice.`
         : `${counts}. A retry will re-send only to the ones that failed.`,

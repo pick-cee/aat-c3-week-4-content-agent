@@ -114,25 +114,28 @@ export async function approveChannel(
   const when =
     scheduledFor ?? request.publish_target ?? (request.hold_in_queue ? null : new Date().toISOString());
 
-  if (!when) {
-    await logInfo(`${output.channel} approved and held in the queue with no send time.`, {
-      requestId,
-      actorId: profile.id,
-    });
-    await moveToScheduled(requestId);
-    revalidatePath(`/requests/${requestId}`);
-    return { ok: true, data: { queued: false, scheduledFor: "" } };
-  }
-
   const kind = CHANNEL_DEFAULT_KIND[output.channel as keyof typeof CHANNEL_DEFAULT_KIND];
 
+  /**
+   * A held item is a ROW, not a skipped insert.
+   *
+   * This used to return early when no send time had been decided, logging
+   * "approved and held in the queue" for a queue row it never created. The
+   * channel read `approved`, the request moved to `scheduled`, and the queue
+   * was empty — the item appeared on no screen in the product. Approved work
+   * vanishing is the worst failure this system can have short of publishing
+   * something unapproved.
+   *
+   * `held` names the state and `scheduled_for` is null, which the schema now
+   * permits and a check constraint keeps consistent (0016, 0017).
+   */
   const { error: queueError } = await db.from(table("publish_queue")).insert({
     request_id: requestId,
     channel_output_id: channelOutputId,
     channel: output.channel,
     kind,
     scheduled_for: when,
-    status: "queued",
+    status: when ? "queued" : "held",
     // Both NOT NULL: a queue row cannot exist without an approval to point at.
     approved_by: profile.id,
     approved_at: approvedAt,
@@ -150,16 +153,79 @@ export async function approveChannel(
   await moveToScheduled(requestId);
 
   await logInfo(
-    `${output.channel} approved and scheduled for ${new Date(when).toLocaleString("en-GB")}.` +
-      (kind === "handoff"
-        ? " It will be sent to whoever posts it; it is not published until they confirm."
-        : ""),
+    when
+      ? `${output.channel} approved and scheduled for ${new Date(when).toLocaleString("en-GB")}.` +
+          (kind === "handoff"
+            ? " It will be sent to whoever posts it; it is not published until they confirm."
+            : "")
+      : `${output.channel} approved and waiting in the queue. Give it a send time to schedule it.`,
     { requestId, actorId: profile.id },
   );
 
   revalidatePath(`/requests/${requestId}`);
   revalidatePath("/queue");
-  return { ok: true, data: { queued: true, scheduledFor: when } };
+  return { ok: true, data: { queued: true, scheduledFor: when ?? "" } };
+}
+
+/**
+ * Approves several channels in one action.
+ *
+ * Channels are still approved INDEPENDENTLY — this calls the same single
+ * channel path for each, so every guarantee holds per channel: its own
+ * approval row, its own queue row, its own NOT NULL columns. What changes is
+ * only the number of clicks.
+ *
+ * A reviewer who has read the article and wants it on all three channels was
+ * previously made to approve them one at a time, each with its own scheduling
+ * decision. That is three times the work for the ordinary case.
+ *
+ * Partial success is reported honestly rather than rolled back: if LinkedIn
+ * queues and X fails its format rules, the LinkedIn approval is real and
+ * saying otherwise would be a lie. The result names what happened to each.
+ */
+export async function approveChannels(
+  requestId: string,
+  channelOutputIds: string[],
+  scheduledFor: string | null,
+  note?: string,
+): Promise<ActionResult<{ approved: string[]; failed: { id: string; error: string }[] }>> {
+  const profile = await currentProfile();
+  if (!profile) return { ok: false, error: "You need to be signed in." };
+  if (!canApprove(profile)) {
+    return { ok: false, error: "Only a reviewer or an admin can approve content for publishing." };
+  }
+
+  if (channelOutputIds.length === 0) {
+    return { ok: false, error: "Pick at least one channel to approve." };
+  }
+
+  const approved: string[] = [];
+  const failed: { id: string; error: string }[] = [];
+
+  // Sequential, not Promise.all: each approval writes to the same request row
+  // (moveToScheduled) and the same queue table, and the per-channel unique
+  // index is what keeps a double-approve honest. Three round trips is not
+  // worth racing.
+  for (const id of channelOutputIds) {
+    const result = await approveChannel(requestId, id, scheduledFor, note);
+    if (result.ok) approved.push(id);
+    else failed.push({ id, error: result.error ?? "That did not work." });
+  }
+
+  revalidatePath(`/requests/${requestId}`);
+  revalidatePath("/queue");
+
+  if (approved.length === 0) {
+    return {
+      ok: false,
+      error:
+        failed.length === 1
+          ? failed[0]!.error
+          : `None of the ${failed.length} channels could be approved. ${failed[0]!.error}`,
+    };
+  }
+
+  return { ok: true, data: { approved, failed } };
 }
 
 async function moveToScheduled(requestId: string): Promise<void> {
@@ -223,7 +289,7 @@ export async function requestRevision(
   const profile = await currentProfile();
   if (!profile) return { ok: false, error: "You need to be signed in." };
   if (!note.trim()) {
-    return { ok: false, error: "Say what needs to change — a revision with no note is a guess." };
+    return { ok: false, error: "Say what needs to change, a revision with no note is a guess." };
   }
 
   const db = serviceClient();
@@ -245,14 +311,114 @@ export async function requestRevision(
     note,
   });
 
+  /**
+   * A human-requested revision gets a fresh budget of rounds.
+   *
+   * The automatic rounds are spent; this is a person saying, in their own
+   * words, what to change. Leaving `revision_rounds` at the cap sent the
+   * request straight back to `needs_human` on the next step, so the button
+   * appeared to do nothing.
+   *
+   * The note is the difference: an automatic round guesses from the checks, a
+   * requested one is told.
+   */
   await db
     .from(table("content_requests"))
-    .update({ status: "revising", current_step: "revise", step_attempts: 0 })
+    .update({
+      status: "revising",
+      current_step: "revise",
+      step_attempts: 0,
+      revision_rounds: 0,
+      failure_reason: null,
+      failure_detail: null,
+      failed_step: null,
+    })
     .eq("id", requestId);
 
   await logInfo(`Revision requested: ${note}`, {
     requestId,
     step: "revise",
+    actorId: profile.id,
+  });
+
+  revalidatePath(`/requests/${requestId}`);
+  return { ok: true };
+}
+
+/**
+ * Accepts a draft the checks rejected, and produces the channel versions.
+ *
+ * `needs_human` stops the pipeline BEFORE adaptation, so there are no channel
+ * outputs to approve: the reviewer was told to approve channels that did not
+ * exist. This is the missing path. It sends the request on to `adapting`,
+ * which writes the channel versions and lands it at the normal approval
+ * screen.
+ *
+ * The note is required. Overriding a measured check is a decision someone
+ * should have to justify in writing, and it is recorded as an approval so the
+ * override is attributable (§14.3).
+ */
+export async function acceptDespiteChecks(
+  requestId: string,
+  note: string,
+): Promise<ActionResult> {
+  const profile = await currentProfile();
+  if (!profile) return { ok: false, error: "You need to be signed in." };
+  if (!canApprove(profile)) {
+    return { ok: false, error: "Only a reviewer or an admin can accept a draft the checks rejected." };
+  }
+  if (!note.trim()) {
+    return {
+      ok: false,
+      error: "Say why you are accepting it. Overriding a measured check needs a reason on record.",
+    };
+  }
+
+  const db = serviceClient();
+
+  const { data: row } = await db
+    .from(table("content_requests"))
+    .select("status")
+    .eq("id", requestId)
+    .maybeSingle();
+
+  if (!row) return { ok: false, error: "That request no longer exists." };
+  if (row.status !== "needs_human") {
+    return { ok: false, error: `A request that is ${row.status} is not waiting on this decision.` };
+  }
+
+  const { data: version } = await db
+    .from(table("article_versions"))
+    .select("id")
+    .eq("request_id", requestId)
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  await db.from(table("approvals")).insert({
+    request_id: requestId,
+    subject_type: "article",
+    subject_id: (version?.id as string) ?? requestId,
+    actor_id: profile.id,
+    decision: "approved",
+    note: `Accepted despite failing checks: ${note}`,
+  });
+
+  await db
+    .from(table("content_requests"))
+    .update({
+      status: "adapting",
+      current_step: "adapt",
+      step_attempts: 0,
+      failure_reason: null,
+      failure_detail: null,
+      failed_step: null,
+    })
+    .eq("id", requestId);
+
+  await logInfo(`A reviewer accepted the draft despite failing checks: ${note}`, {
+    requestId,
+    step: "adapt",
     actorId: profile.id,
   });
 
@@ -467,7 +633,10 @@ export async function rescheduleItem(
 
   // Rescheduling something already sent or in flight would be meaningless at
   // best and misleading at worst.
-  if (!["queued", "blocked_not_connected", "failed"].includes(item.status as string)) {
+  // `held` is the whole point of this list: giving a held item a time is how
+  // it stops being held. Omitting it would leave approved work permanently
+  // stuck, visible and unsendable.
+  if (!["queued", "held", "blocked_not_connected", "failed"].includes(item.status as string)) {
     return {
       ok: false,
       error: `An item that is ${item.status} cannot be rescheduled.`,
@@ -490,10 +659,31 @@ export async function cancelQueueItem(queueId: string): Promise<ActionResult> {
     return { ok: false, error: "Only a reviewer or an admin can cancel a queued item." };
   }
 
-  await serviceClient()
+  // The error was discarded here and `ok: true` returned regardless, so a
+  // rejected write reported success and the button did nothing visible. An
+  // action that cannot fail is an action that cannot be trusted.
+  const { error } = await serviceClient()
     .from(table("publish_queue"))
     .update({ status: "cancelled" })
     .eq("id", queueId);
+
+  if (error) return { ok: false, error: `Could not cancel it: ${error.message}` };
+
+  await logInfo("A queued item was cancelled.", { queueId, actorId: profile.id });
+
+  // Cancelling the last outstanding channel settles the request, exactly as a
+  // send does. Without this a request whose every channel was cancelled sat at
+  // "Scheduled" with nothing left to schedule.
+  const { data: row } = await serviceClient()
+    .from(table("publish_queue"))
+    .select("request_id")
+    .eq("id", queueId)
+    .maybeSingle();
+
+  if (row?.request_id) {
+    const { settleRequestIfDone } = await import("@/lib/publish/worker");
+    await settleRequestIfDone(row.request_id as string);
+  }
 
   revalidatePath("/queue");
   return { ok: true };

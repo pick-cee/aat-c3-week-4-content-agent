@@ -3,7 +3,7 @@ import { serviceClient, table } from "@/lib/db/client";
 import { logInfo, logWarn, logError } from "@/lib/log";
 import { scrape, isUsableSource } from "@/lib/providers/firecrawl";
 import { callWithSearch } from "@/lib/providers/anthropic";
-import { embed, toVectorLiteral } from "@/lib/providers/voyage";
+import { embed, toVectorLiteral, EmbeddingError } from "@/lib/providers/embeddings";
 import { chunkMarkdown } from "./chunking";
 import { priceScrapes, recordModelCall } from "@/lib/cost";
 import {
@@ -21,6 +21,7 @@ import {
   FETCH_CONCURRENCY,
   MIN_SOURCES_FOR_RESEARCH,
   EMBEDDING_BATCH_SIZE,
+  MAX_EMBED_ATTEMPTS,
 } from "@/lib/constants";
 import type { ContentRequest, Source } from "@/lib/db/types";
 
@@ -94,13 +95,33 @@ export async function stepDiscover(request: ContentRequest): Promise<DiscoverRes
             "Prefer primary sources, original research, official documentation and named " +
             "publications. Avoid listicles, SEO farms and pages that only summarise other " +
             "pages.\n\n" +
+            /**
+             * Roughly half of what a search returns cannot be read: pages
+             * behind a login, sites that block scrapers, single-page apps that
+             * render nothing server-side, placeholders. A run that asked for
+             * 3-8 came back with 7 and ended up with ONE real article, which
+             * made everything downstream fail.
+             *
+             * Naming the failure modes is what moves the number, not asking
+             * for more results.
+             */
+            "IMPORTANT, many pages cannot be read once fetched, so choose for " +
+            "READABILITY as well as relevance:\n" +
+            "- Prefer pages that render their article as plain HTML.\n" +
+            "- AVOID anything behind a sign-in: GitLab, Jira, Notion, Google Docs, " +
+            "  LinkedIn posts, Facebook, X/Twitter, Medium member-only stories.\n" +
+            "- AVOID PDFs, video pages, and sites that are mostly an app shell.\n" +
+            "- Prefer documentation sites, company engineering blogs, research " +
+            "  organisations, government and standards bodies, and established " +
+            "  publications.\n\n" +
             "Reply with ONLY a fenced JSON block, no prose before or after:\n" +
             "```json\n" +
             '[{"url": "...", "title": "...", "why": "one line on what this contributes", ' +
             '"confidence": 0.0}]\n' +
             "```\n" +
-            "Between 3 and 8 results. `confidence` is 0 to 1. Every url must be one you " +
-            "actually saw in a search result — do not construct or guess a URL.",
+            "Return 8 to 12 results, expect several to be unreadable, so breadth " +
+            "matters. `confidence` is 0 to 1. Every url must be one you " +
+            "actually saw in a search result, do not construct or guess a URL.",
         },
       ],
       prompt: buildDiscoveryPrompt(request, seedUrls),
@@ -365,11 +386,132 @@ export async function assessResearch(request: ContentRequest): Promise<{
       ok: false,
       usable,
       failed,
-      reason: `Only ${usable} source could be read. One source is not research, so this stopped rather than writing from it.`,
+      reason:
+        `Only ${usable} of ${rows.length} pages could be read. One source is not research, ` +
+        `so this stopped rather than writing an article that rests on a single page.`,
     };
   }
 
   return { ok: true, usable, failed };
+}
+
+/**
+ * Whether there is enough MATERIAL to write from, judged after indexing.
+ *
+ * `assessResearch` runs on fetch status, before anything has been chunked, so
+ * a page that fetched cleanly still counts even if it turns out to hold
+ * nothing usable. That is how a run reached planning with one real article and
+ * a GitLab sign-in page behind it: two "sources" by status, one source in
+ * substance, and every downstream step then failed on material that was never
+ * there.
+ *
+ * The honest place to stop is here — before spending on planning, drafting and
+ * evaluation — with a reason a person can act on. §7.3: "If fewer than two
+ * fetch successfully and the request had no seed URLs, it stops. One source is
+ * not research."
+ */
+export async function assessMaterial(request: ContentRequest): Promise<{
+  ok: boolean;
+  sourcesWithContent: number;
+  excerpts: number;
+  reason?: string;
+}> {
+  const db = serviceClient();
+
+  const { data: excerptRows } = await db
+    .from(table("excerpts"))
+    .select("id, source_id")
+    .eq("request_id", request.id);
+
+  /**
+   * Sources that were read but could not be indexed.
+   *
+   * This is the case that hid for a whole run: six articles of 20k–36k
+   * characters fetched perfectly, the embedding provider rate-limited every
+   * batch, and the only visible symptom three steps later was "the angles are
+   * too similar". Naming the real cause here is the difference between a
+   * five-minute fix and an afternoon.
+   */
+  const { data: failedRows } = await db
+    .from(table("sources"))
+    .select("id, embed_retryable")
+    .eq("request_id", request.id)
+    .eq("embed_failed", true);
+
+  const failed = (failedRows ?? []) as Pick<Source, "id" | "embed_retryable">[];
+  const embedFailed = failed.length;
+  // Still queued for another automatic attempt, as opposed to given up on.
+  const embedPending = failed.filter((s) => s.embed_retryable).length;
+  const rows = excerptRows ?? [];
+  const bySource = new Map<string, number>();
+  for (const row of rows) {
+    const id = row.source_id as string;
+    bySource.set(id, (bySource.get(id) ?? 0) + 1);
+  }
+
+  // A source contributing a single chunk is a stub, not a reference. Counting
+  // it inflates "how much did we find" and is what made the numbers look fine
+  // while the corpus was empty.
+  const substantial = [...bySource.values()].filter((count) => count >= 2).length;
+  const hadSeeds = (request.seed_urls ?? []).length > 0;
+
+  if (rows.length === 0) {
+    return {
+      ok: false,
+      sourcesWithContent: 0,
+      excerpts: 0,
+      reason:
+        "The pages were fetched but none of them produced usable text, so there is nothing " +
+        "to write from. Adding a source URL usually fixes this.",
+    };
+  }
+
+  if (substantial === 0) {
+    return {
+      ok: false,
+      sourcesWithContent: substantial,
+      excerpts: rows.length,
+      reason:
+        "No source produced more than a fragment of text. An article written from this would " +
+        "be padding rather than research, add a source URL and try again.",
+    };
+  }
+
+  if (substantial < MIN_SOURCES_FOR_RESEARCH && !hadSeeds) {
+    // When indexing is what starved it, say THAT. "Add a source URL" is
+    // useless advice if the pages were found and simply could not be indexed.
+    if (embedFailed > 0) {
+      const plural = embedFailed === 1 ? "" : "s";
+      const were = embedFailed === 1 ? "was" : "were";
+      return {
+        ok: false,
+        sourcesWithContent: substantial,
+        excerpts: rows.length,
+        reason:
+          embedPending > 0
+            ? `${embedFailed} source${plural} ${were} read successfully but ${
+                embedFailed === 1 ? "has" : "have"
+              } not been indexed yet, because the embedding service is rate limiting us. ` +
+              `This retries on its own, press Retry in a minute and the material should be there. ` +
+              `Nothing is wrong with the research itself.`
+            : `${embedFailed} source${plural} ${were} read successfully but could not be indexed ` +
+              `after several attempts. The pages are still listed and you can include them by ` +
+              `hand; otherwise add a source URL and try again.`,
+      };
+    }
+
+    return {
+      ok: false,
+      sourcesWithContent: substantial,
+      excerpts: rows.length,
+      reason:
+        `Only ${substantial} of the pages found held enough material to write from. One source ` +
+        `is not research, so this stopped rather than producing three near-identical angles ` +
+        `from a single page. Add a source URL, or try a broader idea.`,
+    };
+  }
+
+  return { ok: true, sourcesWithContent: substantial, excerpts: rows.length };
 }
 
 // ─── Step: chunk_embed (§7.4) ───────────────────────────────────────────────
@@ -381,6 +523,41 @@ export interface ChunkEmbedResult {
   complete: boolean;
 }
 
+/** The fields the pending decision actually turns on. */
+export type EmbedCandidate = Pick<
+  Source,
+  "id" | "embed_failed" | "embed_retryable" | "embed_attempts"
+>;
+
+/**
+ * Which sources still need indexing, in the order to attempt them.
+ *
+ * A source is pending when it has no excerpts AND we have not given up on it.
+ * Giving up means one of two things: the failure was permanent (no chunks to
+ * embed — retrying cannot change that), or it was transient but has already
+ * used its attempts. Anything else comes back around, because the common
+ * transient failure here is a per-minute rate limit that clears on its own.
+ *
+ * Ordering matters as much as the filter. Sources that have never been tried
+ * go first, so one article stuck retrying cannot hold up five that would
+ * succeed immediately.
+ *
+ * Pure and exported so the rule can be tested directly: when this was inline
+ * it excluded every failed source forever, and nothing caught it.
+ */
+export function selectPendingSources<T extends EmbedCandidate>(
+  candidates: T[],
+  indexed: Set<string>,
+): T[] {
+  return candidates
+    .filter((s) => {
+      if (indexed.has(s.id)) return false;
+      if (!s.embed_failed) return true;
+      return s.embed_retryable && s.embed_attempts < MAX_EMBED_ATTEMPTS;
+    })
+    .sort((a, b) => a.embed_attempts - b.embed_attempts);
+}
+
 /**
  * Chunks and embeds one source per invocation, so a long page cannot blow the
  * function budget. Resumable: a source that already has excerpts is skipped.
@@ -390,13 +567,19 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
 
   const { data: sources } = await db
     .from(table("sources"))
-    .select("id, markdown, fetch_status, embed_failed, title")
+    .select("id, markdown, fetch_status, embed_failed, embed_retryable, embed_attempts, title")
     .eq("request_id", request.id)
     .in("fetch_status", ["ok", "too_large", "redirected_offsite"]);
 
   const candidates = (sources ?? []) as Pick<
     Source,
-    "id" | "markdown" | "fetch_status" | "embed_failed" | "title"
+    | "id"
+    | "markdown"
+    | "fetch_status"
+    | "embed_failed"
+    | "embed_retryable"
+    | "embed_attempts"
+    | "title"
   >[];
 
   const { data: existing } = await db
@@ -405,22 +588,32 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
     .eq("request_id", request.id);
 
   const done = new Set((existing ?? []).map((r) => r.source_id as string));
-  const pending = candidates.filter((s) => !done.has(s.id) && !s.embed_failed);
+
+  const pending = selectPendingSources(candidates, done);
 
   if (pending.length === 0) {
     return { sourcesProcessed: 0, excerptsCreated: 0, embedFailures: 0, complete: true };
   }
 
   const source = pending[0]!;
+  const attempt = source.embed_attempts + 1;
   let created = 0;
   let embedFailures = 0;
+  /** Set when this source failed in a way that brings it back around. */
+  let willRetry = false;
 
   const chunks = chunkMarkdown(source.markdown ?? "");
 
   if (chunks.length === 0) {
+    // Permanent: the text is not going to appear on a later attempt.
     await db
       .from(table("sources"))
-      .update({ embed_failed: true, embed_error: "The page produced no chunks to embed." })
+      .update({
+        embed_failed: true,
+        embed_retryable: false,
+        embed_attempts: attempt,
+        embed_error: "The page produced no chunks to embed.",
+      })
       .eq("id", source.id);
     embedFailures++;
   } else {
@@ -451,27 +644,67 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
       }
 
       created = rows.length;
+
+      // A source that failed earlier and has now succeeded must lose the flag,
+      // or gate one keeps showing a failure note for a source that is indexed.
+      if (source.embed_failed) {
+        await db
+          .from(table("sources"))
+          .update({
+            embed_failed: false,
+            embed_retryable: false,
+            embed_attempts: attempt,
+            embed_error: null,
+          })
+          .eq("id", source.id);
+      }
     } catch (err) {
       // §7.4: a source whose chunks could not be embedded is MARKED and
       // excluded from vector selection, but remains available for manual
       // inclusion with a visible note. It is never silently dropped.
+      //
+      // Whether it is also RETRIED turns on the provider's own answer: a 429 or
+      // a 5xx is a statement about this minute, not about this page.
       embedFailures++;
+
+      const retryable = err instanceof EmbeddingError && err.retryable;
+      const exhausted = attempt >= MAX_EMBED_ATTEMPTS;
+      willRetry = retryable && !exhausted;
+
       await db
         .from(table("sources"))
         .update({
           embed_failed: true,
+          embed_retryable: retryable && !exhausted,
+          embed_attempts: attempt,
           embed_error: err instanceof Error ? err.message : String(err),
         })
         .eq("id", source.id);
 
+      const name = `"${source.title ?? "A source"}"`;
       await logWarn(
-        `"${source.title ?? "A source"}" could not be embedded, so it will not be picked automatically. You can still include it by hand.`,
-        { requestId: request.id, step: "chunk_embed", detail: { error: String(err) } },
+        retryable && !exhausted
+          ? `${name} could not be indexed yet because the embedding service is rate limiting us. It will be tried again automatically.`
+          : `${name} could not be embedded, so it will not be picked automatically. You can still include it by hand.`,
+        {
+          requestId: request.id,
+          step: "chunk_embed",
+          detail: { error: String(err), attempt, retryable },
+        },
       );
     }
   }
 
-  const remaining = pending.length - 1;
+  /**
+   * This source counts as finished only if it will not come back around. A
+   * retryable failure leaves it pending, so reporting `complete` here would
+   * move the pipeline on with the source still unindexed — the exact bug this
+   * change exists to fix, one level up.
+   *
+   * The attempt cap is what guarantees this terminates: every pass either
+   * indexes a source or increments its attempt count toward MAX_EMBED_ATTEMPTS.
+   */
+  const remaining = pending.length - (willRetry ? 0 : 1);
   return {
     sourcesProcessed: 1,
     excerptsCreated: created,

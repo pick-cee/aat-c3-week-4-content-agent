@@ -50,10 +50,12 @@ export async function POST(request: Request) {
       p_lease_secs: 5,
     });
 
-    if (!data) {
+    // `setof` returns an array; empty means nothing was runnable.
+    const row = (Array.isArray(data) ? data[0] : data) as { id?: string } | undefined;
+    if (!row?.id) {
       return NextResponse.json({ advanced: false, message: "Nothing to advance." });
     }
-    requestId = (data as { id: string }).id;
+    requestId = row.id;
   }
 
   try {

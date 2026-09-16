@@ -18,6 +18,29 @@ export interface ExcerptLookup {
   };
 }
 
+/**
+ * Removes what only the pipeline needs to see.
+ *
+ * A link marker keeps its ANCHOR TEXT: `((link: interview notes | E8))` is a
+ * phrase the writer meant to appear, so dropping the whole marker would delete
+ * words from the sentence and leave it ungrammatical.
+ */
+function stripInternalMarkup(markdown: string): string {
+  return (
+    markdown
+      // ((link: anchor | E8)) and the malformed ((link: anchor E8)) both keep
+      // the anchor and lose the instruction.
+      .replace(/\(\(link:\s*([^|)]+?)\s*(?:\|\s*E\d+\s*)?\)\)/g, "$1")
+      // [E13] and [E3, E17].
+      .replace(/\s*\[E\d+(?:\s*,\s*E\d+)*\]/g, "")
+      // A marker sitting before punctuation leaves " ." behind.
+      .replace(/\s+([.,;:!?])/g, "$1")
+  );
+}
+
+/** Exposed for the unit test: this guards the one public page in the system. */
+export const stripInternalMarkupForTest = stripInternalMarkup;
+
 export function ArticleView({
   bodyMd,
   claimMap,
@@ -33,9 +56,23 @@ export function ArticleView({
 }) {
   const byIndex = new Map((claimMap ?? []).map((entry) => [entry.sentenceIndex, entry]));
 
+  /**
+   * A reader never sees the machinery.
+   *
+   * `showCitations={false}` only suppressed the superscript BADGE; the
+   * sentence text still carried its raw `[E13]` markers and any
+   * `((link: anchor | E14))` the server had not substituted. Both were
+   * printing on the public permalink, which is the one page in this system a
+   * stranger reads.
+   *
+   * Stripped at render, not in storage: the markers are the grounding record
+   * and every check depends on them surviving on the row.
+   */
+  const readable = showCitations ? bodyMd : stripInternalMarkup(bodyMd);
+
   return (
     <div className="article">
-      {renderBlocks(bodyMd, byIndex, excerpts ?? {}, sources ?? [], showCitations)}
+      {renderBlocks(readable, byIndex, excerpts ?? {}, sources ?? [], showCitations)}
     </div>
   );
 }
@@ -185,9 +222,9 @@ function Citation({
       ? "This citation could not be scored."
       : `Similarity to the cited excerpt: ${(entry.groundingScore * 100).toFixed(0)}%` +
         (entry.verdict === "weak"
-          ? " — weak. The citation is real but only loosely related."
+          ? ", weak. The citation is real but only loosely related."
           : entry.verdict === "unsupported"
-            ? " — the cited excerpt does not appear to support this claim."
+            ? ", the cited excerpt does not appear to support this claim."
             : "");
 
   const firstSource = sources.find((s) => entry.sourceIds.includes(s.id));

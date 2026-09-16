@@ -4,6 +4,7 @@ import { logError, logInfo, logWarn } from "@/lib/log";
 import { randomToken } from "@/lib/crypto";
 import { BudgetExceededError } from "@/lib/cost";
 import {
+  assessMaterial,
   assessResearch,
   stepChunkEmbed,
   stepDiscover,
@@ -23,6 +24,7 @@ import {
   MAX_REVISION_ROUNDS,
 } from "@/lib/constants";
 import type {
+  ComputedChecks,
   Angle,
   ArticleVersion,
   BrandVoice,
@@ -52,6 +54,12 @@ export interface RunnerResult {
   message: string;
   /** True while more work remains, so the caller should poll again. */
   more: boolean;
+  /**
+   * Set only when the last attempt failed and another is coming. The UI shows
+   * the count, because a retry the person cannot see is indistinguishable from
+   * a hang.
+   */
+  attempt?: { current: number; of: number } | null;
 }
 
 /**
@@ -70,8 +78,17 @@ export async function runStep(requestId: string): Promise<RunnerResult> {
     p_lease_secs: RUNNER_LEASE_SECONDS,
   });
 
-  // No row means another runner holds it and this invocation does nothing.
-  if (claimError || !claimed) {
+  /**
+   * No row means another runner holds it and this invocation does nothing.
+   *
+   * `claim_request_lease` returns a scalar composite, so a failed claim comes
+   * back as an OBJECT with every field null rather than as nothing. Checking
+   * the id is what makes the difference visible: a plain truthiness test on
+   * the object passes, which is how the publish worker ended up logging
+   * "channel_output <NULL> does not exist" on every empty sweep.
+   */
+  const claimedRow = claimed as { id?: string } | null;
+  if (claimError || !claimedRow?.id) {
     return {
       advanced: false,
       requestId,
@@ -103,6 +120,22 @@ export async function runStep(requestId: string): Promise<RunnerResult> {
 
     const to = await handleStepFailure(request, err);
 
+    /**
+     * `more` decides whether the client polls again, so it has to mean "a
+     * retry is actually coming", not "something went wrong".
+     *
+     * This returned `more: false` for every failure, including the retryable
+     * ones. The runner wrote "Trying again (attempt 1 of 3)" to the log and
+     * the poller — the only thing that performs that retry while someone is
+     * watching — stopped on the same response. The retry never happened. The
+     * request sat at `evaluating` looking busy, forever.
+     *
+     * A request left in a running state is one the runner intends to pick up
+     * again; a terminal state is not. Saying so honestly is what makes the
+     * retry real.
+     */
+    const willRetry = willRetryAfterFailure(to);
+
     return {
       advanced: true,
       requestId,
@@ -110,9 +143,35 @@ export async function runStep(requestId: string): Promise<RunnerResult> {
       to,
       step: (request.current_step as PipelineStep) ?? null,
       message: err instanceof Error ? err.message : String(err),
-      more: false,
+      more: willRetry,
+      attempt: willRetry
+        ? { current: request.step_attempts + 1, of: MAX_STEP_ATTEMPTS }
+        : null,
     };
   }
+}
+
+/**
+ * States the runner will advance again. Anything else is terminal or waiting
+ * on a person, and polling it would spin without ever changing.
+ */
+const RETRYING_STATUSES = new Set<RequestStatus>([
+  "researching",
+  "drafting",
+  "evaluating",
+  "revising",
+  "adapting",
+]);
+
+/**
+ * Whether a failure that left the request in `status` will actually be retried.
+ *
+ * Exported so the rule is testable directly: the bug it guards against was the
+ * runner saying "trying again" while the poller stopped, and nothing in the
+ * type system could catch a disagreement between those two.
+ */
+export function willRetryAfterFailure(status: RequestStatus): boolean {
+  return RETRYING_STATUSES.has(status);
 }
 
 /**
@@ -185,11 +244,51 @@ async function handleStepFailure(
     .eq("id", request.id);
 
   await logWarn(
-    `The ${stepLabel(step)} step failed (attempt ${attempts} of ${MAX_STEP_ATTEMPTS}). It will be retried.`,
+    // Says what is actually true. The retry is real — the poller calls the
+    // runner again and the step resumes from stored state — but the previous
+    // wording implied something was already happening, while the retry only
+    // fires on the next poll.
+    `${stepLabel(step)} did not complete. Trying again (attempt ${attempts} of ${MAX_STEP_ATTEMPTS}).`,
     { requestId: request.id, step, detail: { error: message } },
   );
 
   return request.status;
+}
+
+/**
+ * Names the computed checks that are still failing, in plain words.
+ *
+ * "It failed evaluation" tells a reviewer nothing they can act on. These are
+ * measured facts, so they can be stated precisely.
+ */
+function describeFailingChecks(computed: ComputedChecks): string[] {
+  const failing: string[] = [];
+
+  if (!computed.sourceGrounding.passed) {
+    failing.push(
+      `only ${computed.sourceGrounding.markedSentences} of ` +
+        `${computed.sourceGrounding.factualSentences} factual sentences cite a source`,
+    );
+  }
+  if (!computed.factualConsistency.passed) {
+    failing.push(
+      computed.factualConsistency.numberDisagreements > 0
+        ? `${computed.factualConsistency.numberDisagreements} figure(s) disagree with the source`
+        : `${computed.factualConsistency.unsupportedCandidates} claim(s) carry no citation`,
+    );
+  }
+  if (!computed.seoFit.passed) failing.push("the SEO checks");
+  if (!computed.completeness.passed) {
+    failing.push(
+      `${computed.completeness.outlineSectionsPresent} of ` +
+        `${computed.completeness.outlineSectionsExpected} planned sections are present`,
+    );
+  }
+  if (computed.bannedPhrases.length > 0) {
+    failing.push(`banned phrases: ${computed.bannedPhrases.join(", ")}`);
+  }
+
+  return failing;
 }
 
 function stepLabel(step: PipelineStep | string): string {
@@ -331,8 +430,40 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
 
   if (step === "score") {
     await stepScore(request);
+
+    /**
+     * The last honest moment to stop.
+     *
+     * Everything up to here is cheap; everything after is not. Checking
+     * material AFTER indexing is what makes this reliable — `assessResearch`
+     * ran on fetch status, so a page that fetched cleanly but held no article
+     * still counted, and a request could reach planning with one real source
+     * behind two rows. It then failed repeatedly on material that was never
+     * there, which is expensive and looks like the system is broken.
+     */
+    const material = await assessMaterial(request);
+
+    if (!material.ok) {
+      await setStatus(request.id, "needs_human", "score", {
+        research_outcome: "insufficient_material",
+        failure_reason: material.reason ?? null,
+      });
+      await notifyTerminalFailure(request.id, "needs_human", material.reason ?? "");
+      return {
+        to: "needs_human",
+        step: "score",
+        message: material.reason ?? "There is not enough material to write from.",
+        more: false,
+      };
+    }
+
     await setStatus(request.id, "researching", "plan");
-    return { to: "researching", step: "plan", message: "Ranked the sources.", more: true };
+    return {
+      to: "researching",
+      step: "plan",
+      message: `Ranked the sources. ${material.sourcesWithContent} have enough material to write from.`,
+      more: true,
+    };
   }
 
   // plan — the last research step, which ends at gate one.
@@ -406,9 +537,13 @@ async function advanceEvaluating(request: ContentRequest): Promise<Advance> {
 
   // An evaluation that could not run must never be treated as a pass (§5.8).
   if (evaluation.status === "not_evaluated") {
+    // The reason is kept in `evaluations.error` and the activity log for
+    // whoever debugs it; what surfaces on the request is what a content
+    // manager can act on. Nobody reviewing an article should have to read
+    // about token limits.
     throw new Error(
-      `The evaluation could not run: ${evaluation.error ?? "unknown reason"}. ` +
-        `The draft was not approved, because an evaluation that did not happen is not a pass.`,
+      "The quality check could not complete, so the draft was not approved, " +
+        "an evaluation that did not happen is not a pass. Retrying usually clears it.",
     );
   }
 
@@ -424,7 +559,31 @@ async function advanceEvaluating(request: ContentRequest): Promise<Advance> {
 
   // Two revision rounds, then needs_human. It never loops (§2.7).
   if (request.revision_rounds >= MAX_REVISION_ROUNDS) {
-    await setStatus(request.id, "needs_human", "evaluate");
+    /**
+     * The reason is STORED, not just emailed.
+     *
+     * This was the one needs_human path that recorded nothing, so the request
+     * page said "No reason was recorded, which is itself worth reporting" and
+     * offered only Cancel, on the case where a finished draft is sitting there
+     * waiting for a judgement call.
+     */
+    const failing = evaluation.computed
+      ? describeFailingChecks(evaluation.computed)
+      : [];
+
+    await setStatus(request.id, "needs_human", "evaluate", {
+      failure_reason:
+        `The draft was rewritten ${MAX_REVISION_ROUNDS} times and still did not pass. ` +
+        (failing.length > 0
+          ? `What is still failing: ${failing.join("; ")}. `
+          : "") +
+        `Read it and decide: approve it as it stands, edit it yourself, or cancel.`,
+      failure_detail: {
+        revisionRounds: request.revision_rounds,
+        evaluationStatus: evaluation.status,
+        failingChecks: failing,
+      },
+    });
     await notifyTerminalFailure(
       request.id,
       "needs_human",

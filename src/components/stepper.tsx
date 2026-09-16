@@ -74,13 +74,28 @@ export function Stepper({ request }: { request: ContentRequest }) {
               <span className="step-mark">
                 {isFailed ? "!" : isDone ? "✓" : index + 1}
               </span>
-              {stage.label}
+              {labelFor(stage.key, stage.label, request)}
             </div>
           </div>
         );
       })}
     </div>
   );
+}
+
+/**
+ * The last stage covers scheduled, publishing and published, and rendering it
+ * as a lit "Publish" made a request sitting in the queue look like it was
+ * mid-send. The stage is the same; what it is doing is not.
+ */
+function labelFor(stageKey: string, label: string, request: ContentRequest): string {
+  if (stageKey !== "publish") return label;
+  switch (request.status) {
+    case "scheduled": return "In the queue";
+    case "publishing": return "Sending";
+    case "published": return "Published";
+    default: return label;
+  }
 }
 
 function titleFor(stageKey: string, request: ContentRequest): string {
@@ -105,7 +120,9 @@ function titleFor(stageKey: string, request: ContentRequest): string {
     case "content_review":
       return "You approve each channel independently.";
     case "publish":
-      return "Approved content is released on schedule.";
+      return request.status === "scheduled"
+        ? "Approved and waiting for its send time. Nothing is being sent right now."
+        : "Approved content is released on schedule.";
     default:
       return "";
   }

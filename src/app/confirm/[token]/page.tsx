@@ -106,7 +106,7 @@ export default async function ConfirmPage({
             <p className="small muted">
               {CHANNEL_LABELS[item.channel]} does not allow this system to post on the agency&rsquo;s
               behalf, so here is the approved post, ready to copy. Once it is live, paste the URL
-              below — until then it stays marked as awaiting posting, never as published.
+              below, until then it stays marked as awaiting posting, never as published.
             </p>
           )}
 

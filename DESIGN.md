@@ -578,11 +578,30 @@ research.
 ### 7.4 Chunking and embedding
 
 Successful markdown is chunked (§5.5) and every chunk embedded with
-`voyage-3.5-lite` at 512 dimensions, in batches of 128, with
-`input_type: "document"`. Embedding failure is retried once; a source whose
-chunks could not be embedded is marked and excluded from vector selection but
-remains available for manual inclusion, with a visible note. It is never silently
-dropped.
+`text-embedding-3-small` at 512 dimensions, in batches of 128, with
+`input_type: "document"`. A source whose chunks could not be embedded is marked
+and excluded from vector selection but remains available for manual inclusion,
+with a visible note. It is never silently dropped.
+
+**Transient and permanent failures are different facts.** Embedding rejection is
+usually a per-minute rate limit, which says nothing about the page — so the
+source is marked `embed_retryable` and attempted again on a later invocation, up
+to `MAX_EMBED_ATTEMPTS` (3). A permanent failure, such as a page that produced no
+chunks at all, is marked not-retryable and skipped from then on. A source that
+later succeeds has the flag cleared, so the reviewer never sees a failure note on
+a source that is indexed.
+
+Two mechanisms protect against the rate limit, and they are not the same thing.
+Requests are *paced* (a minimum gap between calls) to avoid hitting the limit,
+and *backed off* in tens of seconds when one is hit anyway, because a per-minute
+quota cannot be cleared by retrying a second later.
+
+This is written down because conflating the two failures cost a whole run: six
+articles of 20k–36k characters were fetched, refused once, and then permanently
+excluded from re-indexing. Two sources survived, "two sources per angle" (§8.2)
+became unsatisfiable, and the symptom that reached the manager three steps later
+was *"these three angles are too similar"* — a complaint about angles, caused by
+an embedding quota.
 
 ### 7.5 Relevance and selection
 
@@ -971,8 +990,58 @@ then the judged scores. Every flagged claim is a link that scrolls the article
 to that sentence.
 
 Actions: **Approve** per channel (channels are approved independently),
-**Request revision** with a note, **Edit** the article directly, **Reject** the
-request. Approving at least one channel moves the request to scheduling.
+**Approve all** for the ordinary case, **Request revision** with a note,
+**Edit** the article directly, **Reject** the request. Approving at least one
+channel moves the request to scheduling.
+
+**One column, decision first.** Gate two was a side-by-side split giving the
+ARTICLE the larger half: 1,243 words the reviewer had already approved, and
+which they cannot even edit once a channel is approved, taking more of the
+screen than the decision they came to make. Both halves scrolled independently,
+so the panel became a letterbox inside an already short card.
+
+The order is now what-needs-you, then the decision panel at full width, then the
+article behind a disclosure, open while it is still editable and collapsed once
+it is not. The activity log stays at the bottom but shows its most recent entry
+in the summary, because a collapsed log under a long article is a log nobody
+knows exists.
+
+**The screen is composed, not monolithic.** `gate-two.tsx` orchestrates and
+owns the article; each panel is its own module under `components/review/`
+calling its own server actions with its own pending and error state. The single
+858-line version threaded shared state through every panel, which is how
+approving one channel came to spin every button on the screen and how one
+`readOnly` flag came to answer two unrelated questions. A panel receives the
+facts it reads (`holdInQueue`, `publishTarget`), never the whole request.
+
+**Approving one channel must never close the others.** Approval moves the
+request to `scheduled`, and gate two derived a single read-only flag from that
+status — so approving LinkedIn removed the approve button from a newsletter that
+was still a draft. The server always allowed it; the UI locked itself. Two
+separate questions, answered separately (`isArticleLocked`,
+`areChannelsLocked`): the ARTICLE closes once anything is approved from it,
+because the approved channel versions were derived from that text, while the
+CHANNELS stay decidable until the request is published or cancelled. The screen
+leads with the outstanding decision rather than leaving a reviewer to count
+status pills across two panes.
+
+"Independently" is about the guarantees, not the number of clicks. Approve-all
+calls the same single-channel path per channel, so each still gets its own
+approval row, its own queue row and its own NOT NULL columns; partial success is
+reported honestly rather than rolled back, because an approval that really
+happened is not undone by a later one failing. Only clean drafts are included —
+a `format_failed` channel needs a written note saying why it is going out
+anyway, which is a deliberate per-channel decision.
+
+**Approved work is never invisible.** A held item is a ROW, not a skipped
+insert. `publish_queue.scheduled_for` was NOT NULL, so "approved, no send time
+decided" had no representation; the approval action handled that by skipping the
+insert and logging "held in the queue" about a row it never created. The channel
+read `approved`, the request moved to `scheduled`, and the queue was empty — the
+item appeared on no screen in the product. `held` now names that state, with a
+null send time and a check constraint keeping the two consistent. The release
+worker claims only `queued` rows with a due time, so a held item is visible and
+deliberately not due.
 
 ### 14.3 Publishing is not possible before approval
 
@@ -1001,13 +1070,23 @@ Two kinds, and the worker branches on `connectors.kind`, never on a channel name
 | X          | `handoff`    | Same.                                                                                                                          |
 
 **A connector is a row, and its absence is a state.** The publish worker reads
-`connectors` before it reads the queue. A channel whose connector is
-`not_connected`, `expired` or `revoked` puts its queued items into
+`connectors` before it reads the queue. A **delivering** channel whose connector
+is `not_connected`, `expired` or `revoked` puts its queued items into
 `blocked_not_connected` with the reason, and the dashboard shows a banner. The
 items stay queued and go out when the connector is restored. The system never
 renders "published" for something that did not happen — an honest blocked state is
 worth more than a fake success, and a fake success is precisely the failure mode
 this program grades against.
+
+**A handoff channel is never blocked for want of a connection**, because it has
+no account to connect: a person posts it, and the system only has to email them
+the packet. The check ran before the `kind` branch and therefore blocked every
+LinkedIn and X item on a credential §2.11 deliberately does not require —
+nothing ever dispatched, and the queue reported two of three channels "not
+ready" when nothing was wrong with either. The rule lives in
+`needsConnectedAccount` (`src/lib/publish/gate.ts`), pure and tested, because
+this was a silent failure no type could catch. What a handoff actually needs is
+an assigned poster, checked at dispatch where the address matters.
 
 Token refresh runs before each send when `expires_at` is within ten minutes. A
 refresh failure sets `expired` and blocks rather than attempting a call that will 401.
@@ -1167,6 +1246,41 @@ unnoticed, because someone is told, on the channel they actually read.
 that a founder had to read too much before understanding the state of things.
 The fix is not more prose written better; it is less prose.
 
+### 16.0 Visual system
+
+Calibrated against the tools this kind of product is measured by — Vercel,
+Linear, Supabase — which share a specific discipline rather than a look:
+
+- **A 4px grid**, with nothing between the steps.
+- **Hairline borders carry structure; shadows are reserved for things that
+  genuinely float.** A shadow on every card is what made the first version read
+  as dated: if everything is elevated, elevation means nothing.
+- **14px body, 13px secondary, 12px meta.** Denser than a marketing page,
+  because a manager scanning twelve requests wants more on screen, not less.
+- **Tight tracking on headings, normal on reading text.** Compression reads as
+  engineered at display sizes and as cramped at reading sizes. Article body is
+  15.5px at 1.72 line-height and capped at 68ch, which is a reading measure
+  rather than an interface one.
+- **Tabular figures** anywhere a number updates in place, so counts and costs
+  do not jitter as they change.
+- **One accent colour.** Colour means status in this system, so spending it on
+  decoration leaves nothing to say "this failed" with.
+- **Dark mode is a first-class palette**, defined token by token rather than
+  derived by inversion, because these are tools people keep open all day.
+
+### 16.0.1 What the interface must never ask a person to do
+
+Anything with an exact mechanical answer is computed, not delegated. An X post
+handed back with "cut at least 46 characters" is the system asking a founder to
+do arithmetic it could do perfectly; it is trimmed at a sentence boundary
+instead, and marked as trimmed so the edit is visible. Judgment calls still go
+to a person, and the distinction is whether the answer is computable, not
+whether it is inconvenient.
+
+Evidence is shown whole. A flagged claim truncated mid-word cannot be checked,
+which defeats the purpose of flagging it. Recommendations are a list of discrete
+actions rather than a paragraph, capped in the schema.
+
 **Dashboard.** A row of tiles first: _Needs you_ · _Scheduled today_ ·
 _Failed or blocked_ · _Spent this month_. Each is a number and a label, each
 links to a filtered list. Below, request cards: status pill, headline or idea,
@@ -1183,6 +1297,18 @@ and per-item cost. A WhatsApp broadcast shows its recipient count and, once sent
 its delivered-of-total. A handoff item shows who it went to and whether they have
 confirmed. `uncertain` items pin to the top in red with their two
 buttons.
+
+**Recycle bin.** Deleting a request sets `deleted_at` rather than removing the
+row. A hard delete cascaded to `model_calls` and took the costs with it, so
+clearing out a few drafts made "Spent this month" read $0 for money that had
+genuinely been spent — a cost report a delete can rewrite is not a report. The
+bin lists what was deleted with its cost, and restores in one click.
+
+Permanent deletion is available from the bin and rolls the spend into
+`retained_spend` first: a standalone ledger, keyed by month, with no foreign key
+to anything, so there is no row whose removal can take it away. The dashboard's
+monthly total is live spend plus retained spend, and it filters deleted requests
+out of the work counts but never out of the money.
 
 Empty states say what is missing and what to do, never a bare zero. A tile
 reading "0 failed" when the failure count could not be loaded is a lie, so the
@@ -1206,6 +1332,24 @@ somewhere.
 draft that failed marker integrity twice, a 400 from a platform — no retry
 button. A 429, a 5xx, an embedding failure, a timed-out fetch — retry button,
 and it resumes from the failed step rather than from the beginning.
+
+**And an automatic retry must be real.** `POST /api/runner` returns `more`,
+which is what tells the client poller to call again; the poller is the only
+thing performing automatic retries while someone is watching. Returning
+`more: false` on a retryable failure while logging "trying again" means the
+retry never happens and the request sits behind a spinner indefinitely — worse
+than an error, because an error can be acted on. `more` therefore means "a
+retry is coming", decided by one exported predicate (`willRetryAfterFailure`)
+that both the runner and the UI read, and the attempt count is shown to the
+person watching rather than only written to the log.
+
+A retry is also only honest if the failure could succeed later. A budget
+refusal cannot: the next attempt costs the same and the money is just as
+absent. `BudgetExceededError` must reach the runner intact — a step that
+catches it, retries it once, and flattens it into a generic message turns a
+terminal condition into four wasted attempts and tells the manager that
+"retrying usually clears it". Terminal failures name what they need and who can
+supply it.
 
 **Unknown is not zero.** Stated once, applied at every layer where Week 2 proved
 it has to be applied separately:
@@ -1237,7 +1381,7 @@ it has to be applied separately:
 | `claude-haiku-4-5` | $1 / MTok | $5 / MTok  |
 
 `web_search` $10 per 1,000 searches. `web_fetch` free beyond tokens.
-Voyage `voyage-3.5-lite` roughly $0.02 / MTok. Firecrawl per credit per scrape.
+OpenAI `text-embedding-3-small` roughly $0.02 / MTok. Firecrawl per credit per scrape.
 
 Delivery:
 
@@ -1341,7 +1485,7 @@ tokens each. Adding WhatsApp cost roughly a third of a cent.
 
 ## 19. Security
 
-1. **No key reaches the browser.** Anthropic, Firecrawl, Voyage, Resend,
+1. **No key reaches the browser.** Anthropic, Firecrawl, OpenAI, Resend,
    Supabase service role and WhatsApp credentials are read server-side only,
    in route handlers and server actions. No `NEXT_PUBLIC_` key is a secret.
 2. **Connector tokens are encrypted at rest** with AES-256-GCM, key from
@@ -1529,8 +1673,15 @@ one, not discovered on submission day.
    not instant. Submit one on day one — generic, parameterised, reusable — so the
    outside-the-window path can be demonstrated rather than described. The
    inside-the-window path needs no template and no approval.
-5. **Firecrawl and Voyage free tiers** should be confirmed against the expected
-   volume in §18.3 before either is assumed free.
+5. **Firecrawl and embedding free tiers** should be confirmed against the
+   expected volume in §18.3 before either is assumed free. **Settled, the hard
+   way:** Voyage's free tier allows only a few requests a minute, and the limit
+   did not announce itself — it refused six fetched articles of 20k–36k
+   characters, which left two usable sources and surfaced three steps later as
+   "the angles are too similar". The provider is now OpenAI
+   `text-embedding-3-small` at the same $0.02/MTok. A free tier is not a cheaper
+   version of a paid tier; it is a different failure mode, and it fails inside
+   the pipeline rather than at the door.
 6. **Nothing here needs X or LinkedIn credentials.** That is the point of §2.11,
    and it removes the two prerequisites most likely to have eaten a day.
 

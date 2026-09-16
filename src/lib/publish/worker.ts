@@ -6,6 +6,7 @@ import { notifyPublishProblem, sendHandoffPacket } from "@/lib/notify";
 import { signHandoffToken } from "@/lib/crypto";
 import { renderNewsletterHtml } from "./render";
 import { rollUpDeliveries, isAlreadyHandled } from "./rollup";
+import { needsConnectedAccount } from "./gate";
 import { env } from "@/lib/env";
 import {
   PUBLISH_BATCH_SIZE,
@@ -105,7 +106,18 @@ export async function runRelease(): Promise<ReleaseResult> {
 async function claimNext(): Promise<PublishQueueItem | null> {
   const { data, error } = await serviceClient().rpc("claim_due_publish_item");
   if (error || !data) return null;
-  return data as unknown as PublishQueueItem;
+
+  /**
+   * A `setof` function returns an array, and an empty one means nothing was
+   * due. The belt-and-braces check on `id` is deliberate: this function used
+   * to return a scalar composite, so "nothing to claim" arrived as an OBJECT
+   * with every field null, which is truthy. The worker took that phantom for a
+   * real item and logged "channel_output <NULL> does not exist" on every
+   * sweep over an empty queue.
+   */
+  const row = (Array.isArray(data) ? data[0] : data) as PublishQueueItem | undefined;
+  if (!row?.id) return null;
+  return row;
 }
 
 // ─── Publishing one item ────────────────────────────────────────────────────
@@ -139,7 +151,20 @@ async function publishItem(item: PublishQueueItem): Promise<PublishOutcome> {
   // branches on `kind`, never on a channel name.
   const connector = await loadConnector(item.channel);
 
-  if (!connector || connector.status !== "connected") {
+  /**
+   * Only a DELIVERING channel needs a connected account.
+   *
+   * A handoff channel is posted by a person: the system emails them a
+   * copy-ready packet and they confirm with a URL. It has never needed a
+   * LinkedIn or X credential — that is the entire reason §2.11 chose handoff
+   * over pretending to publish.
+   *
+   * This gate ran before the `kind` branch, so a LinkedIn item was marked
+   * `blocked_not_connected` and never dispatched, waiting on a connection the
+   * design deliberately does not require. `dispatchHandoff` has the gate that
+   * actually applies: whether anyone is assigned to post it.
+   */
+  if (needsConnectedAccount(item.kind, connector?.status)) {
     await setStatus(item, "blocked_not_connected", {
       status: "blocked_not_connected",
       last_error: connectorReason(connector?.status),
@@ -185,9 +210,11 @@ function connectorReason(status: ConnectorStatus | undefined): string {
 async function dispatchHandoff(
   item: PublishQueueItem,
   output: ChannelOutput,
-  connector: { handoff_email?: string | null },
+  // Null when no connector row exists for this channel, which is normal for a
+  // handoff: the poster's address falls back to HANDOFF_POSTER_EMAIL.
+  connector: { handoff_email?: string | null } | null,
 ): Promise<PublishOutcome> {
-  const to = connector.handoff_email || env.app.handoffPosterEmail;
+  const to = connector?.handoff_email || env.app.handoffPosterEmail;
 
   if (!to) {
     await setStatus(item, "blocked_not_connected", {
@@ -214,7 +241,11 @@ async function dispatchHandoff(
     articleUrl: output.link_url,
     charCount: output.char_count ?? output.body.length,
     confirmUrl,
-    scheduledFor: item.scheduled_for,
+    // Only a claimed row reaches here, and `claim_due_publish_item` requires
+    // status = 'queued' with a due time — a held row has neither, so it is
+    // never dispatched. The fallback keeps the type honest rather than
+    // asserting a non-null the compiler cannot see.
+    scheduledFor: item.scheduled_for ?? new Date().toISOString(),
   });
 
   if (!sent.ok) {
@@ -418,7 +449,7 @@ async function sweepStuck(): Promise<number> {
         item.id,
         "uncertain",
         "The send timed out and we cannot tell whether it went. It will NOT be retried " +
-          "automatically — open the queue and tell us whether it sent.",
+          "automatically, open the queue and tell us whether it sent.",
       );
     }
   }
@@ -479,7 +510,7 @@ async function reconcile(item: PublishQueueItem): Promise<boolean> {
 async function markUncertain(item: PublishQueueItem, reason: string): Promise<void> {
   await setStatus(item, "uncertain", {
     status: "uncertain",
-    last_error: `${reason} — the outcome is unknown, so this will not be retried automatically.`,
+    last_error: `${reason}, the outcome is unknown, so this will not be retried automatically.`,
   });
 
   await logError(
@@ -551,5 +582,68 @@ async function setStatus(
       queueId: item.id,
       detail: { error: error.message },
     });
+    return;
   }
+
+  await settleRequestIfDone(item.request_id);
+}
+
+/**
+ * Moves a request out of `scheduled` once no channel is still waiting.
+ *
+ * Nothing did this: the worker updated queue rows and never touched the
+ * request, so a request whose newsletter had sent, whose LinkedIn was
+ * cancelled and whose X post was rejected still read "Scheduled" on the
+ * dashboard, indefinitely. The status word outlived everything it described.
+ *
+ * `published` means at least one channel genuinely went out. If every channel
+ * was cancelled or rejected then nothing was published and saying so would be
+ * a success the system never received (rule 9), so it becomes `cancelled`.
+ */
+export async function settleRequestIfDone(requestId: string): Promise<void> {
+  const db = serviceClient();
+
+  const { data: rows, error } = await db
+    .from(table("publish_queue"))
+    .select("status")
+    .eq("request_id", requestId);
+
+  if (error || !rows || rows.length === 0) return;
+
+  const statuses = rows.map((r) => r.status as PublishStatus);
+
+  // Anything still in motion, or waiting on a person, is not settled.
+  const pending = statuses.some((s) =>
+    ["queued", "held", "publishing", "awaiting_manual_post", "uncertain", "blocked_not_connected"]
+      .includes(s),
+  );
+  if (pending) return;
+
+  const anyDelivered = statuses.some((s) =>
+    ["published", "published_dry_run", "posted_manually", "partially_delivered"].includes(s),
+  );
+
+  const next = anyDelivered ? "published" : "cancelled";
+
+  const { data: current } = await db
+    .from(table("content_requests"))
+    .select("status")
+    .eq("id", requestId)
+    .maybeSingle();
+
+  // Only advance from `scheduled`/`publishing`: a request a person cancelled
+  // or that failed earlier keeps the state that explains why.
+  if (!current || !["scheduled", "publishing"].includes(current.status as string)) return;
+
+  await db
+    .from(table("content_requests"))
+    .update({ status: next, current_step: null })
+    .eq("id", requestId);
+
+  await logInfo(
+    next === "published"
+      ? "Every channel is resolved and at least one went out, so the request is published."
+      : "Every channel was cancelled or rejected, so nothing went out.",
+    { requestId },
+  );
 }

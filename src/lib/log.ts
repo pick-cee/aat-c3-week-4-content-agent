@@ -18,7 +18,10 @@ const SECRET_VALUE_PATTERNS: RegExp[] = [
   /sk-ant-[A-Za-z0-9_-]{20,}/g,        // Anthropic
   /\bfc-[a-f0-9]{24,}\b/gi,            // Firecrawl
   /\bre_[A-Za-z0-9_-]{20,}\b/g,        // Resend
-  /\bpa-[A-Za-z0-9_-]{20,}\b/g,        // Voyage
+  // OpenAI embeddings. Covers sk-proj-, sk-svcacct- and the classic sk- form;
+  // the Anthropic pattern above is matched first, so sk-ant- is not caught here.
+  /\bsk-(?:proj|svcacct|admin)?-?[A-Za-z0-9_-]{20,}\b/g,
+  /\bpa-[A-Za-z0-9_-]{20,}\b/g,        // Voyage, kept: old logs may hold one
   /\bsb_secret_[A-Za-z0-9_-]{16,}\b/g, // Supabase service role
   /\bey[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, // JWT
   /\bEA[A-Za-z0-9]{80,}\b/g,           // Meta access token

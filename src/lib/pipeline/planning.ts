@@ -131,6 +131,68 @@ export interface PlanResult {
 }
 
 /**
+ * Takes a usable keyword out of the headline the model actually wrote.
+ *
+ * The keyword must appear in the headline, so when the two disagree the
+ * headline wins: it is the thing a reader sees, and the keyword is derived
+ * from it. Prefers the longest run of the intended keyword's own words that
+ * survives in the headline, so "expectations gap" against a headline about
+ * "rejecting offers" still yields something related rather than arbitrary.
+ *
+ * Returns null when nothing usable remains, which is a real violation.
+ */
+export function keywordFromHeadline(headline: string, intended: string): string | null {
+  const stop = new Set([
+    "the", "a", "an", "and", "or", "but", "for", "to", "of", "in", "on", "at",
+    "is", "are", "was", "were", "why", "how", "what", "when", "your", "you",
+    "it", "its", "that", "this", "with", "than", "from", "can", "will",
+  ]);
+
+  const words = headline
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+
+  if (words.length === 0) return null;
+
+  const intendedWords = new Set(
+    intended.toLowerCase().split(/\s+/).filter((w) => w && !stop.has(w)),
+  );
+
+  // The longest contiguous run of two or three content words, preferring one
+  // that overlaps what the model meant the keyword to be.
+  let best: { phrase: string; overlap: number } | null = null;
+
+  for (let size = 3; size >= 2; size--) {
+    for (let i = 0; i + size <= words.length; i++) {
+      const run = words.slice(i, i + size);
+      if (run.some((w) => stop.has(w))) continue;
+
+      const phrase = run.join(" ");
+      const overlap = run.filter((w) => intendedWords.has(w)).length;
+
+      if (!best || overlap > best.overlap) best = { phrase, overlap };
+    }
+    // A three-word phrase that shares a word with the intent beats a two-word
+    // one that does not, so only stop early on a genuine match.
+    if (best && best.overlap > 0) break;
+  }
+
+  if (best && containsKeyword(headline, best.phrase)) return best.phrase;
+
+  // Fall back to the first two content words, which are in the headline by
+  // construction.
+  const content = words.filter((w) => !stop.has(w));
+  if (content.length >= 2) {
+    const phrase = content.slice(0, 2).join(" ");
+    if (containsKeyword(headline, phrase)) return phrase;
+  }
+
+  return null;
+}
+
+/**
  * A broken constraint, and whether asking again could fix it.
  *
  * The distinction is what stops the pipeline burning three planning calls on
@@ -397,11 +459,29 @@ async function checkAngleConstraints(
       });
     }
 
+    /**
+     * A keyword that is not in its headline is REPAIRED, not rejected.
+     *
+     * This burned all three planning attempts, twice, on separate requests:
+     * the model invents a phrase like "expectations gap", writes a good
+     * headline that does not contain it, and fails its own constraint. Three
+     * Haiku calls and 69 seconds to produce angles that were fine.
+     *
+     * The keyword is DERIVED data: it has to appear in the headline, so the
+     * headline is the source of truth and the keyword can be taken from it.
+     * Rewriting the whole plan because a derived field disagrees with the
+     * field it derives from is the wrong trade.
+     */
     if (!containsKeyword(angle.headline, angle.primaryKeyword)) {
-      violations.push({
-        message: `Angle ${i + 1} headline "${angle.headline}" does not contain its primary keyword "${angle.primaryKeyword}".`,
-        fixable: true,
-      });
+      const repaired = keywordFromHeadline(angle.headline, angle.primaryKeyword);
+      if (repaired) {
+        angle.primaryKeyword = repaired;
+      } else {
+        violations.push({
+          message: `Angle ${i + 1} headline "${angle.headline}" does not contain its primary keyword "${angle.primaryKeyword}", and no usable phrase could be taken from it.`,
+          fixable: true,
+        });
+      }
     }
 
     /**

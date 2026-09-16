@@ -126,7 +126,29 @@ export async function runStep(requestId: string): Promise<RunnerResult> {
     };
   }
 
-  const request = claimed as unknown as ContentRequest;
+  // `claimedRow`, not `claimed`: the RPC returns an ARRAY since it became
+  // `setof`, and casting the array itself to a row made every field
+  // undefined. The screen read "Nothing for the runner to do while the
+  // request is undefined" and the pipeline stopped dead.
+  const request = claimedRow as unknown as ContentRequest;
+
+  /**
+   * A claimed row without a status is not a row.
+   *
+   * The cast above is unchecked, and when it was pointed at the RPC's array
+   * wrapper every field read as undefined. The UI dutifully printed "Nothing
+   * for the runner to do while the request is undefined" and the pipeline
+   * stopped, with nothing in the log to say why. A cast that can be wrong
+   * deserves one assertion.
+   */
+  if (!request?.status) {
+    await db.rpc("release_request_lease", { p_request_id: requestId, p_lease_id: leaseId });
+    throw new Error(
+      `The runner claimed request ${requestId} but the row came back without a status. ` +
+        `Nothing was changed and the lease was released.`,
+    );
+  }
+
   const from = request.status;
 
   try {

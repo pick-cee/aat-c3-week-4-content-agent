@@ -23,6 +23,15 @@ import type { RequestStatus } from "@/lib/db/types";
  * the activity log, which is where someone debugging goes; it has no business
  * in the banner someone reads to know whether their article is being written.
  */
+/**
+ * How many failed polls in a row before giving up.
+ *
+ * Three at a three-second cadence is about ten seconds of trying, which covers
+ * a restart or a slow provider without spinning forever on something genuinely
+ * broken.
+ */
+const MAX_CONSECUTIVE_FAILURES = 3;
+
 function presentable(message: string): string | null {
   if (!message) return null;
 
@@ -61,6 +70,8 @@ export function RunnerPoll({
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState<{ current: number; of: number } | null>(null);
   const running = useRef(false);
+  // Consecutive failures, reset by any success.
+  const failures = useRef(0);
   const stopped = useRef(false);
 
   useEffect(() => {
@@ -81,11 +92,38 @@ export function RunnerPoll({
 
         if (!response.ok) {
           const body = (await response.json().catch(() => ({}))) as { error?: string };
-          setError(presentable(body.error ?? "") ?? "The pipeline stopped advancing. Nothing was lost, reloading resumes from where it got to.");
+
+          /**
+           * One bad response used to stop the poller for good, leaving the
+           * request sitting mid-pipeline behind "the pipeline stopped
+           * advancing, reloading resumes from where it got to" — which asked
+           * a person to do by hand what the poller was there to do.
+           *
+           * A step is resumable by design (§3.1), so a failure is worth
+           * retrying before giving up. A 401 is not: that one will never
+           * resolve by trying again.
+           */
+          const permanent = response.status === 401 || response.status === 403;
+          failures.current += 1;
+
+          if (!permanent && failures.current < MAX_CONSECUTIVE_FAILURES) {
+            setError(null);
+            router.refresh();
+            return;
+          }
+
+          setError(
+            presentable(body.error ?? "") ??
+              "The pipeline stopped advancing after several attempts. Nothing was lost: " +
+                "every step stores its output before the next begins.",
+          );
           stopped.current = true;
           router.refresh();
           return;
         }
+
+        // A good response clears the run of failures.
+        failures.current = 0;
 
         const result = (await response.json()) as {
           advanced: boolean;
@@ -115,8 +153,20 @@ export function RunnerPoll({
           return;
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : "Could not reach the runner.");
-        stopped.current = true;
+        // A dropped connection is the most transient failure there is, and it
+        // used to stop the poller for good. A laptop waking from sleep should
+        // not end a pipeline run.
+        failures.current += 1;
+        if (failures.current < MAX_CONSECUTIVE_FAILURES) {
+          setError(null);
+        } else {
+          setError(
+            err instanceof Error
+              ? `Could not reach the runner: ${err.message}`
+              : "Could not reach the runner.",
+          );
+          stopped.current = true;
+        }
       } finally {
         running.current = false;
       }

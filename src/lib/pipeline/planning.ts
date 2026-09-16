@@ -76,7 +76,9 @@ export const ANGLE_SCHEMA = {
           label: { type: "string", description: "A 2-4 word name for this direction." },
           headline: {
             type: "string",
-            description: "The article headline. MUST contain the primary keyword.",
+            description:
+              "The article headline. MUST contain primaryKeyword as a contiguous " +
+              "phrase, word for word. Checked by literal string match.",
           },
           outline: {
             type: "array",
@@ -91,7 +93,12 @@ export const ANGLE_SCHEMA = {
               },
             },
           },
-          primaryKeyword: { type: "string" },
+          primaryKeyword: {
+            type: "string",
+            description:
+              "Two or three words, lifted verbatim from the headline above. Not a " +
+              "description of the topic: a phrase that literally appears in it.",
+          },
           secondaryKeywords: {
             type: "array",
             description: "At most 6 secondary keywords.",
@@ -169,7 +176,18 @@ export async function planAngles(
         "A useful test: if two of your headlines could sit under the same subheading " +
         "of a single article, they are too close.\n\n" +
         "Hard rules:\n" +
-        "- The primary keyword MUST appear in the headline.\n" +
+        /**
+         * The keyword rule is a LITERAL contiguous match, and the model was
+         * never told so. It invented four-word keywords like "time-to-hire
+         * process drag", wrote a natural headline, and failed its own
+         * constraint on three attempts in a row.
+         */
+        "- The primary keyword MUST appear in the headline as a CONTIGUOUS phrase,\n" +
+        "  word for word, in that order. This is a literal string check: a headline\n" +
+        "  about 'hiring delays' does NOT satisfy the keyword 'hiring bottlenecks'.\n" +
+        "- Keep the keyword SHORT, two or three words, and choose it by writing the\n" +
+        "  headline first and then lifting the phrase out of it. Do not invent a\n" +
+        "  keyword that describes the topic and hope the headline matches it.\n" +
         `- Each angle must draw on at least ${MIN_SOURCES_PER_ANGLE} DIFFERENT sources.\n` +
         `- Each outline has ${ANGLE_OUTLINE_MIN_SECTIONS} to ${ANGLE_OUTLINE_MAX_SECTIONS} H2 sections.\n` +
         "- Only reference excerpt labels that appear in the digest below.\n" +
@@ -278,7 +296,23 @@ export async function planAngles(
     { requestId: request.id, step: "plan", detail: { violations: lastViolations } },
   );
 
-  return { angles: lastResult!.angles, warnings: lastViolations };
+  /**
+   * `lastResult` is only set after a call RETURNS. If every attempt threw —
+   * a provider timeout, a 429, the function being killed at its duration
+   * limit — the non-null assertion here crashed with "cannot read properties
+   * of null", which surfaced as a bare "the pipeline stopped advancing" and
+   * nothing in the log to explain it.
+   *
+   * An error a person can act on is the minimum owed here (§17).
+   */
+  if (!lastResult) {
+    throw new Error(
+      "Angle planning could not complete: every attempt failed before returning a " +
+        "result. The sources are saved, so retrying resumes from here.",
+    );
+  }
+
+  return { angles: lastResult.angles, warnings: lastViolations };
 }
 
 /**

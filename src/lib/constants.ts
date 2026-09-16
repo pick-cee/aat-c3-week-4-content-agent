@@ -380,8 +380,23 @@ export const HANDOFF_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
 // ─── The step runner. DESIGN.md §3.1. ───────────────────────────────────────
 
-/** No row returned from the lease claim means another runner holds it. */
-export const RUNNER_LEASE_SECONDS = 90;
+/**
+ * How long a claimed request stays claimed. No row returned from the claim
+ * means another runner holds it.
+ *
+ * MUST exceed the longest a single step can run, or the lease expires while
+ * the step is still working and a second runner claims the same request.
+ * Planning makes up to three model calls plus an embedding each, which was
+ * measured at 82 seconds against a 90 second lease: close enough that a slow
+ * provider turned into two runners racing, one of them crashing, and a request
+ * left sitting at "researching" with nothing in the log.
+ *
+ * The route's own ceiling is 60 seconds (`maxDuration`), so a step is killed
+ * by the platform long before this expires. That is the point: the lease
+ * outliving the work means a dead runner's claim is released by the watchdog,
+ * never stolen from a live one.
+ */
+export const RUNNER_LEASE_SECONDS = 300;
 /** Then the request stops at `failed` naming the step, not an infinite retry. */
 export const MAX_STEP_ATTEMPTS = 3;
 /** URLs per `fetch` invocation, sized to fit the function budget. §3.1. */

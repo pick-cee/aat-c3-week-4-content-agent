@@ -613,6 +613,11 @@ export interface Database {
         Args: { p_request_id: string; p_lease_id: string; p_lease_secs?: number };
         Returns: ContentRequest;
       };
+      /** Pushes a running step's lease forward. Only the holder may renew. */
+      renew_request_lease: {
+        Args: { p_request_id: string; p_lease_id: string; p_lease_secs?: number };
+        Returns: boolean;
+      };
       /** Copies a request's spend to the standalone ledger before a purge. */
       retain_request_spend: {
         Args: { p_request_id: string };

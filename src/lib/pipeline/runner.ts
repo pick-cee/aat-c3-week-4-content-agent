@@ -68,6 +68,12 @@ export interface RunnerResult {
  * Returns `advanced: false` without doing anything if another runner holds the
  * lease — that is a normal outcome, not an error (§3.1).
  */
+/**
+ * How often a running step pushes its lease forward. Comfortably inside
+ * RUNNER_LEASE_SECONDS so a single missed tick cannot lose the claim.
+ */
+const LEASE_HEARTBEAT_MS = 20_000;
+
 export async function runStep(requestId: string): Promise<RunnerResult> {
   const db = serviceClient();
   const leaseId = randomToken(12);
@@ -151,9 +157,32 @@ export async function runStep(requestId: string): Promise<RunnerResult> {
 
   const from = request.status;
 
+  /**
+   * Keeps the claim alive while the step is genuinely working.
+   *
+   * The lease is deliberately short so a DEAD worker frees the request fast.
+   * That killed live work too: evaluation runs the grounding embeddings and
+   * then an Opus judge, which together outlast the lease, so it expired
+   * mid-step, another poller claimed the same request, and the step restarted.
+   * Six attempts, zero judge calls, four minutes on screen.
+   *
+   * A worker that dies stops calling this and its lease lapses on schedule,
+   * which is the distinction the timeout alone could not draw.
+   */
+  const heartbeat = setInterval(() => {
+    void db
+      .rpc("renew_request_lease", {
+        p_request_id: requestId,
+        p_lease_id: leaseId,
+        p_lease_secs: RUNNER_LEASE_SECONDS,
+      })
+      .then(() => undefined, () => undefined);
+  }, LEASE_HEARTBEAT_MS);
+
   try {
     const result = await advance(request);
 
+    clearInterval(heartbeat);
     await db.rpc("release_request_lease", {
       p_request_id: requestId,
       p_lease_id: leaseId,
@@ -161,6 +190,7 @@ export async function runStep(requestId: string): Promise<RunnerResult> {
 
     return { ...result, advanced: true, requestId, from };
   } catch (err) {
+    clearInterval(heartbeat);
     await db.rpc("release_request_lease", {
       p_request_id: requestId,
       p_lease_id: leaseId,

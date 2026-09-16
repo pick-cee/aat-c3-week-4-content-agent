@@ -14,6 +14,24 @@ import { logError } from "@/lib/log";
  * Also acts as the runner's safety net: after draining the queue it advances
  * one in-flight request, so a pipeline nobody is watching still progresses
  * (§3.1).
+ *
+ * WHO CALLS THIS, and why `vercel.json` has no `crons` block:
+ *
+ * Vercel's Hobby plan allows one cron run a day and rejects a sub-daily
+ * schedule outright, which cannot keep a send time a person chose to the
+ * minute. `.github/workflows/release.yml` calls this every minute instead,
+ * with the same shared secret.
+ *
+ * Two things that are NOT schedulers here. `lib/publish/scheduler.ts` keeps
+ * time inside a long-running server process, which serverless does not have:
+ * the instance is frozen after the response, so its timer fires only when
+ * something else has kept it warm. And `components/release-heartbeat.tsx`
+ * sends what is due from whatever page is open, which helps nobody at 03:00.
+ * Both are conveniences; the workflow is the guarantee.
+ *
+ * On a Pro plan, add the `crons` block back and delete the workflow. Running
+ * both is harmless: the claim is one atomic statement, so two schedulers
+ * racing is a normal outcome rather than a double send (§15.2).
  */
 
 export const maxDuration = 60;

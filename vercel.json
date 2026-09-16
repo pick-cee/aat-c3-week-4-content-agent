@@ -1,6 +1,5 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "//": "No `crons` block, deliberately. Vercel's Hobby plan allows ONE cron run a day, which cannot keep a send time a person chose to the minute, and a */5 schedule is rejected outright. `.github/workflows/release.yml` drives /api/cron/release every five minutes instead, authenticated with the same CRON_SECRET. On a Pro plan, add the block back and delete the workflow: the endpoint is identical and the atomic claim in §15.2 means two schedulers racing is a normal outcome rather than a double send. DESIGN.md §23.1.",
   "functions": {
     "src/app/api/runner/route.ts": { "maxDuration": 60 },
     "src/app/api/cron/release/route.ts": { "maxDuration": 60 }

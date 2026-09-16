@@ -251,19 +251,41 @@ export const ARTICLE_MAX_WORDS = 2_000;
  * streaming, 8,000 by Haiku 4.5. The real ceiling is the ten-minute
  * non-streaming limit, not the token count.
  */
+/**
+ * Output ceilings per call, sized to MEASURED output rather than guessed.
+ *
+ * These were 8k-16k across the board, which is not free: a model asked for
+ * room to write 16,000 tokens takes the time to consider writing them. Steps
+ * were measured at 166s (evaluate), 142s (revise) and 141s (plan) against a
+ * runner route that the platform kills at 60s, so on Vercel every one of them
+ * would die mid-flight.
+ *
+ * Each ceiling is now roughly double the largest output that step has ever
+ * produced, which leaves real headroom while cutting the time spent reaching
+ * for it. `widenedLimit` still doubles these on a truncation retry, so an
+ * unusually long piece is not lost, it simply costs a second call.
+ *
+ * Measured over 63 calls on 2026-09-16:
+ *   revise    max 12,250  avg 9,356   ← the one that genuinely needs room
+ *   draft     max  8,285  avg 3,037
+ *   evaluate  max  4,441  avg 3,324
+ *   discover  max  1,431
+ *   adapt     max  1,415  avg   599
+ *   plan      max  1,050  avg   910
+ */
 export const MAX_TOKENS = {
-  /** A 2,000-word article with citation markers is ~4k. This is 4x that. */
-  drafting: 16_000,
-  /** Replacement sections, but a revision can touch most of the article. */
-  revision: 16_000,
-  /** Four criteria with real reasoning, plus every section needing work. */
-  evaluation: 16_000,
-  /** Three angles, each with an outline and a rationale. */
-  planning: 8_000,
-  /** One short post and its declared spans — but a newsletter is 600 words. */
-  adaptation: 8_000,
-  /** Search results as a JSON list, with the model's reasoning about them. */
-  discovery: 8_000,
+  /** A 2,000-word article with citation markers is ~4k; measured max 8,285. */
+  drafting: 12_000,
+  /** Replacement sections. Measured max 12,250: the largest output we produce. */
+  revision: 14_000,
+  /** Four criteria with reasoning plus a section list. Measured max 4,441. */
+  evaluation: 8_000,
+  /** Three angles with outlines and rationales. Measured max 1,050. */
+  planning: 3_000,
+  /** One short post, or a 600-word newsletter. Measured max 1,415. */
+  adaptation: 3_000,
+  /** Search results as JSON with reasoning. Measured max 1,431. */
+  discovery: 3_000,
   /** A title, a meta description and keywords. */
   articleHeader: 2_000,
   /** One sentence. */
@@ -301,6 +323,16 @@ export const MIN_SOURCES_PER_ANGLE = 2;
 // ─── Evaluation and revision. DESIGN.md §11. ────────────────────────────────
 
 /** Two rounds, then needs_human. It never loops. DESIGN.md §2.7. */
+/**
+ * Sections rewritten per revision invocation.
+ *
+ * Sized so one call fits inside the runner route's 60-second ceiling. Five
+ * sections produced 12,250 tokens and 282 seconds; two is comfortably inside
+ * the budget, and anything left over is handled by the next round rather than
+ * by a step the platform kills half way through.
+ */
+export const MAX_SECTIONS_PER_REVISION = 2;
+
 export const MAX_REVISION_ROUNDS = 2;
 /** Each re-plan costs money and the button shows the amount. DESIGN.md §14.1. */
 export const MAX_REPLANS_BEFORE_CONFIRM = 2;
@@ -381,22 +413,29 @@ export const HANDOFF_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 // ─── The step runner. DESIGN.md §3.1. ───────────────────────────────────────
 
 /**
- * How long a claimed request stays claimed. No row returned from the claim
- * means another runner holds it.
+ * How long a claimed request stays claimed. No row from the claim means
+ * another runner holds it.
  *
- * MUST exceed the longest a single step can run, or the lease expires while
- * the step is still working and a second runner claims the same request.
- * Planning makes up to three model calls plus an embedding each, which was
- * measured at 82 seconds against a 90 second lease: close enough that a slow
- * provider turned into two runners racing, one of them crashing, and a request
- * left sitting at "researching" with nothing in the log.
+ * Tied to `maxDuration` on the runner route, which is what actually bounds a
+ * step: the platform kills the function at 60 seconds, so no live step can
+ * still be working after that. The lease is a little longer to cover the
+ * response and the release write, and no longer.
  *
- * The route's own ceiling is 60 seconds (`maxDuration`), so a step is killed
- * by the platform long before this expires. That is the point: the lease
- * outliving the work means a dead runner's claim is released by the watchdog,
- * never stolen from a live one.
+ * Both extremes hurt, and this build has now had each:
+ *
+ *   TOO SHORT (90s) and the lease expired under a planning step still making
+ *   its third model call, so a second runner claimed the same request and
+ *   raced it.
+ *
+ *   TOO LONG (300s) and a runner that DIED — a dev server restart, a crashed
+ *   function — held the request for five minutes while the UI said "another
+ *   worker is already advancing this request" and nothing was.
+ *
+ * A dead worker's claim has to expire quickly, because nothing else releases
+ * it. Anything longer than the function can live is time a person spends
+ * staring at a lie.
  */
-export const RUNNER_LEASE_SECONDS = 300;
+export const RUNNER_LEASE_SECONDS = 75;
 /** Then the request stops at `failed` naming the step, not an infinite retry. */
 export const MAX_STEP_ATTEMPTS = 3;
 /** URLs per `fetch` invocation, sized to fit the function budget. §3.1. */

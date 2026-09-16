@@ -87,15 +87,41 @@ export async function runStep(requestId: string): Promise<RunnerResult> {
    * the object passes, which is how the publish worker ended up logging
    * "channel_output <NULL> does not exist" on every empty sweep.
    */
-  const claimedRow = claimed as { id?: string } | null;
+  // `setof` returns an array; empty means the lease is held elsewhere.
+  const claimedRow = (Array.isArray(claimed) ? claimed[0] : claimed) as
+    | { id?: string }
+    | undefined;
   if (claimError || !claimedRow?.id) {
+    /**
+     * "Another worker is already advancing this request" was asserted, never
+     * checked. A runner that DIED still holds its lease until it expires, so
+     * this sat on screen for six minutes while nothing was advancing anything.
+     *
+     * The lease is now bounded by the function's own ceiling, so a claim this
+     * old means the holder is gone rather than busy. Saying which is the
+     * difference between "wait" and "something is wrong".
+     */
+    const { data: row } = await db
+      .from(table("content_requests"))
+      .select("runner_lease_until")
+      .eq("id", requestId)
+      .maybeSingle();
+
+    const leaseUntil = row?.runner_lease_until as string | null | undefined;
+    const secondsLeft = leaseUntil
+      ? Math.max(0, Math.round((new Date(leaseUntil).getTime() - Date.now()) / 1000))
+      : 0;
+
     return {
       advanced: false,
       requestId,
       from: "draft",
       to: "draft",
       step: null,
-      message: "Another worker is already advancing this request.",
+      message:
+        secondsLeft > 0
+          ? `A step is still running. It has up to ${secondsLeft}s left before it is retried.`
+          : "Picking this back up.",
       more: true,
     };
   }

@@ -18,6 +18,7 @@ import {
   MAX_UNSUPPORTED_CLAIMS,
   MAX_WEAK_CITATION_RATIO,
   MIN_MARKED_SENTENCE_RATIO,
+  MAX_SECTIONS_PER_REVISION,
 } from "@/lib/constants";
 import { segmentSentences, stripMarkdown } from "@/lib/text";
 import { BudgetExceededError } from "@/lib/cost";
@@ -622,7 +623,19 @@ export async function reviseArticle(
   evaluation: Evaluation,
   excerpts: LabelledExcerpt[],
 ): Promise<ArticleVersion> {
-  const sections = evaluation.sections_to_revise ?? [];
+  /**
+   * At most two sections per invocation, whoever chose them.
+   *
+   * The judge can name five, and rewriting five sections of a 1,300-word
+   * article produced 12,250 output tokens, hit the ceiling, retried at a
+   * higher one, and took 282 seconds against a 60-second function limit.
+   *
+   * A step that cannot finish inside the platform's budget is a step that
+   * never finishes at all, so the work is bounded here instead. Sections left
+   * over are picked up on the next revision round: the runner advances one
+   * step at a time and every step resumes from stored state (§3.1).
+   */
+  const sections = (evaluation.sections_to_revise ?? []).slice(0, MAX_SECTIONS_PER_REVISION);
   const flagged = [
     ...(evaluation.unsupported_claims ?? []),
     ...(evaluation.weak_citations ?? []),
@@ -738,8 +751,51 @@ function inferSectionsFromComputed(
     problems.push(`Remove these banned phrases: ${computed.bannedPhrases.join(", ")}.`);
   }
 
+  /**
+   * At most three sections, never the whole article.
+   *
+   * This returned EVERY H2, so a revision with no named sections rewrote the
+   * entire piece: 12,250 output tokens, a truncation retry at a higher
+   * ceiling, and 282 seconds for one step. Section-scoped revision exists
+   * precisely to avoid that, and the fallback was undoing it.
+   *
+   * The sections carrying flagged sentences are the ones that need work, so
+   * they are chosen first; the opening section is the fallback when nothing
+   * is flagged, because that is where an ungrounded claim usually sits.
+   */
   const headings = (version.headings ?? []).filter((h) => h.level === 2);
-  return headings.map((h) => ({ heading: h.text, problem: problems.join(" ") }));
+  if (headings.length === 0) return [];
+
+  const flaggedText = [
+    ...(evaluation.unsupported_claims ?? []),
+    ...(evaluation.weak_citations ?? []),
+  ]
+    .map((c) => c.sentence)
+    .join(" ")
+    .toLowerCase();
+
+  const body = version.body_md ?? "";
+
+  // A section is implicated when one of its own sentences was flagged.
+  const implicated = headings.filter((h) => {
+    const start = body.indexOf(h.text);
+    if (start === -1) return false;
+    const nextStarts = headings
+      .map((other) => body.indexOf(other.text))
+      .filter((i) => i > start);
+    const end = nextStarts.length > 0 ? Math.min(...nextStarts) : body.length;
+    const section = body.slice(start, end).toLowerCase();
+    return flaggedText.length > 0 && section.split(/[.!?]/).some((sentence) => {
+      const t = sentence.trim();
+      return t.length > 40 && flaggedText.includes(t.slice(0, 40));
+    });
+  });
+
+  const chosen = (implicated.length > 0 ? implicated : headings.slice(0, 1)).slice(
+    0,
+    MAX_SECTIONS_PER_REVISION,
+  );
+  return chosen.map((h) => ({ heading: h.text, problem: problems.join(" ") }));
 }
 
 function buildRevisionPrompt(

@@ -10,7 +10,6 @@ import {
 } from "@/components/status";
 import { QueueActions } from "@/components/queue-actions";
 import { UncertainDeliveries } from "@/components/uncertain-deliveries";
-import { QueueRunner } from "@/components/queue-runner";
 import { ViewPostButton } from "@/components/view-post-button";
 import type {
   ConnectorStatusRow,
@@ -173,9 +172,6 @@ export default async function QueuePage() {
         </div>
       </div>
 
-      {/* Sends what is due while this page is open, so a schedule is kept
-          without waiting for cron. */}
-      <QueueRunner />
 
       <UncertainDeliveries />
 

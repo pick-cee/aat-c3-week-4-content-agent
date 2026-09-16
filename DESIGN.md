@@ -1655,11 +1655,25 @@ Named here so they read as decisions rather than omissions.
 These are external facts that shape the build and that must be confirmed on day
 one, not discovered on submission day.
 
-1. **Vercel cron frequency is plan-dependent.** A five-minute release cadence
-   needs a paid plan. On the free plan the schedule is far coarser, and the
-   fallback is an external scheduler hitting `/api/cron/release` with the same
-   shared secret. Either is fine; a queue that only drains once a day is not,
-   because the video needs to show a scheduled post going out.
+1. **Vercel cron frequency is plan-dependent. SETTLED: GitHub Actions.**
+   A five-minute release cadence needs a paid plan; Hobby allows one run a day
+   and rejects a `*/5` schedule outright. `vercel.json` therefore carries NO
+   `crons` block, and `.github/workflows/release.yml` drives
+   `/api/cron/release` every five minutes with the same shared secret.
+
+   Two things this does not rely on. The in-process scheduler
+   (`lib/publish/scheduler.ts`) keeps time on a long-running server, but a
+   serverless platform tears the process down between requests, so it fires
+   only when something has happened to keep a instance warm. And the queue page
+   drains what is due while it is open, which helps nobody at 03:00. Neither is
+   a scheduler on Vercel; the workflow is.
+
+   The same endpoint also advances one in-flight request per call, so the
+   workflow covers research as well as publishing.
+
+   On a Pro plan, restore the `crons` block and delete the workflow. Running
+   both is harmless: the atomic claim (§15.2) means two schedulers racing is a
+   normal outcome, not a double send.
 2. **Function duration limits** set how much each runner step may attempt. The
    fetch step's batch size (§3.1, four URLs) is derived from this and should be
    tuned once the real limit is known.

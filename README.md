@@ -28,6 +28,37 @@ request costs a fraction of a cent, but a free tier's per-minute limit silently
 drops sources from the research instead of failing loudly. Changing embedding
 provider invalidates every stored vector, so the two must never be mixed.
 
+## Deploying to Vercel
+
+Set every key from `.env.example` in the project's environment variables, then:
+
+**Scheduled posts need a scheduler, and the free plan is not one.** Vercel's
+Hobby plan allows one cron run a day and rejects a five-minute schedule, so
+`vercel.json` has no `crons` block. `.github/workflows/release.yml` drives
+`/api/cron/release` every minute instead, because a send time is chosen to the
+minute and a five-minute cadence would turn 6:33 into 6:35. Add two repository
+secrets under
+Settings → Secrets and variables → Actions:
+
+| Secret | Value |
+| --- | --- |
+| `APP_URL` | `https://your-app.vercel.app`, no trailing slash |
+| `CRON_SECRET` | the same value you set in Vercel |
+
+Then run the workflow once by hand (Actions → Release scheduled content → Run
+workflow) to confirm it returns 200 rather than 401. Without those secrets,
+approved content sits in the queue past its send time and nothing says why.
+
+While someone has the app open, a heartbeat in the layout also sends what is due
+every thirty seconds, so a schedule feels immediate rather than waiting for the
+next external run. That is a convenience, not the guarantee: nobody has a tab
+open at 03:00.
+
+On a Pro plan you can restore the `crons` block in `vercel.json` and delete the
+workflow. Running both is harmless: the worker claims each row in one atomic
+statement, so two schedulers racing is a normal outcome rather than a double
+send.
+
 ## The documents
 
 - `PRD.md` — the brief

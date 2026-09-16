@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { currentProfile } from "@/lib/db/client";
 import { env } from "@/lib/env";
+import { ReleaseHeartbeat } from "@/components/release-heartbeat";
 
 /**
  * The signed-in workspace: nav, identity, demo badge.
@@ -67,6 +68,11 @@ export default async function AppLayout({ children }: { children: React.ReactNod
               </div>
             </div>
           </header>
+
+          {/* Keeps the schedule from whatever page is open. The external
+              workflow is the guarantee; this makes it immediate while someone
+              is actually using the app. */}
+          <ReleaseHeartbeat />
 
           <main className="main">{children}</main>
         </div>

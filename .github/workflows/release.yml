@@ -1,0 +1,52 @@
+name: Release scheduled content
+
+# Vercel's Hobby plan allows ONE cron run a day, which cannot keep a send time
+# that a person chose to the minute. GitHub Actions has no such limit on a
+# public repository, so it drives the same endpoint instead.
+#
+# Two secrets are needed in the repository (Settings → Secrets and variables →
+# Actions):
+#   APP_URL      https://your-app.vercel.app   (no trailing slash)
+#   CRON_SECRET  the same value as in Vercel's environment variables
+on:
+  schedule:
+    # Every minute, because a send time is chosen to the minute: a five-minute
+    # cadence turns 6:33 into 6:35. GitHub queues these on a best-effort basis
+    # and can still run late under load, so the guarantee is "within a minute
+    # or two of the time you set", not "to the second".
+    - cron: "* * * * *"
+  # So a deploy can be tested without waiting for the next slot.
+  workflow_dispatch:
+
+# A slow publish must never overlap the next run.
+concurrency:
+  group: release-worker
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Send anything that is due
+        env:
+          APP_URL: ${{ secrets.APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${APP_URL:-}" ] || [ -z "${CRON_SECRET:-}" ]; then
+            echo "APP_URL and CRON_SECRET must both be set as repository secrets."
+            exit 1
+          fi
+
+          # --fail-with-body so a 401 or a 500 fails the run loudly and the
+          # response is still printed. A silent scheduler is worse than none.
+          response=$(curl --silent --show-error --fail-with-body \
+            --max-time 120 \
+            --retry 2 --retry-delay 5 --retry-all-errors \
+            -X POST "${APP_URL}/api/cron/release" \
+            -H "Authorization: Bearer ${CRON_SECRET}" \
+            -H "Content-Type: application/json")
+
+          echo "$response"

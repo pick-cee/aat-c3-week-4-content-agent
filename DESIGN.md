@@ -22,7 +22,7 @@ idle work, but closing it does not cancel a job. GitHub Actions is a five-minute
 recovery sweep, not a punctual scheduler. Next routes allow 300 seconds; provider
 calls have shorter explicit deadlines and no hidden SDK retries.
 
-Sonnet writes and judges, with thinking disabled for these bounded editorial
+Sonnet 5 (`claude-sonnet-5`) writes and judges, with thinking disabled for these bounded editorial
 tasks. Haiku plans and adapts. Prompts and output limits are bounded; a compact
 drafting corpus replaces the former 12,000-token allowance. Metadata is derived
 from the article without a second model. Saved drafts, completed evaluations and
@@ -855,7 +855,7 @@ the same treatment.
 | Channel Fit         | The checks in §12, per channel                                                                        |
 | Completeness        | Every outline section present, every requested channel produced, image present if required            |
 
-**Judged — one call, Claude Opus 5:**
+**Judged — one call, Claude Sonnet 5 (`claude-sonnet-5`):**
 
 | Criterion       | Why a model                                                                                 |
 | --------------- | ------------------------------------------------------------------------------------------- |
@@ -1454,40 +1454,39 @@ change and a stale price is a wrong cost report.
 | Relevance ranking            | **none** (vectors)       | Cosine similarity, not a model.                                                  |
 | Angle planning               | Haiku 4.5                | Short, schema-constrained, three options from a digest.                          |
 | Article drafting             | **Sonnet 5**             | Publication-quality long-form prose with real judgment. The largest token spend. |
-| Evaluation                   | **Opus 5**               | See below.                                                                       |
+| Evaluation                   | **Sonnet 5**             | Bounded editorial review; model-change rationale and validation limits below.    |
 | Revision                     | Sonnet 5                 | Same class of work as drafting, on a smaller span.                               |
 | Channel adaptation           | Haiku 4.5                | Explicit rules, short outputs, low judgment.                                     |
 | Alt text                     | Haiku 4.5                | One sentence from a title.                                                       |
 
-**The inversion worth explaining.** The obvious assignment is the strongest model
-for writing and a cheaper one for grading. This design does the opposite, and the
-arithmetic is why. A 1,500-word article is roughly 2,200 output tokens on a
-drafting call carrying about 14k input tokens. On Sonnet 5 that is about 2.8
-cents in and 2.2 cents out. The evaluation call carries the same article as
-_input_ — about 3k tokens — and returns perhaps 800 tokens of structured
-verdict. On Opus 5 that is 1.5 cents in and 2 cents out. **Judging costs about a
-third of what writing costs**, because the judge reads one article and writes a
-paragraph while the writer reads a corpus and writes an article.
+**Evaluation model change (17 September 2026).** Commit `33c1258`
+("Fixes") changed evaluation from Opus 5 (`claude-opus-5`) to Sonnet 5
+(`claude-sonnet-5`). This replaces the original decision to use Opus at the
+quality gate. Drafting and revision also use Sonnet 5. The runtime assignment is
+`MODELS.evaluation` in `src/lib/constants.ts`.
 
-Given that, the question is where an extra cent buys more. It buys more at the
-gate. A better writer produces prose a human would have edited anyway; a better
-judge is what stops a weak draft from reaching a human at all, and the judged
-criteria — audience fit, tone against a stored voice, clarity — are exactly the
-ones that reward judgment. Opus 5 for evaluation and Sonnet 5 for drafting costs
-roughly two cents more per article than the conventional arrangement and puts
-the stronger model where a mistake is most expensive.
+The change was part of the cost and latency refactor: use Sonnet for bounded
+editorial judgments while retaining deterministic grounding, numeric, SEO and
+format checks. Computed failures still override a model's passing verdict, and
+publication still requires human approval. These controls do not establish
+that Sonnet and Opus provide equivalent editorial judgment.
 
-The alternative considered and rejected: Opus 5 for both. That roughly doubles
-the drafting cost for prose quality that Sonnet 5 already delivers at
-publication standard, on the step with the largest token volume in the system.
-It is the single easiest way to triple the running cost of this pipeline without
-improving what a reader sees.
+No side-by-side Opus-versus-Sonnet benchmark was run before this change. The
+recorded tests verify that the Sonnet evaluation path works; they do not prove
+equivalent quality, a measured latency improvement, or measured savings from
+this model substitution. Treat those benefits as the motivation, not a
+validated comparison. The former Opus cost argument is superseded by this
+decision; `W4-TEST-REPORT.md` records the actual run results and remaining gaps.
 
 Every assignment is per task, not per project, and every call records
 `model_used` so the assumption can be checked against real spend rather than
 argued about.
 
 ### 18.3 Estimated cost of one full request
+
+Historical pre-refactor estimates: the table below includes the former Opus
+evaluation assignment and is not a current Sonnet cost forecast. Use recorded
+model usage and `W4-TEST-REPORT.md` for observed costs.
 
 | Step                         | Estimate   |
 | ---------------------------- | ---------- |

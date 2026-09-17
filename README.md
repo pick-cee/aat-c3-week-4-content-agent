@@ -44,7 +44,7 @@ To exercise background drafting without starting the release worker, run `node s
 
 The worker processes content requests and releases approved, due queue items. Point development at a separate database and use `DEMO_MODE=true`. Demo delivery can still send to an explicitly configured redirect inbox. Leave `RESEND_API_KEY` empty when no email should leave the environment.
 
-For a disposable demo workspace, set `ENABLE_DEMO_LOGIN=true` and `DEMO_MODE=true` before seeding. Keep demo access disabled for client work. `AUTO_MIGRATE=true` is an explicit local convenience only; it is not the production deployment path.
+Set `ENABLE_DEMO_LOGIN=true` to provision and allow the Maya demo account. This works with either `DEMO_MODE=true` or `DEMO_MODE=false`; `DEMO_MODE` controls delivery routing independently of account access. Keep demo access disabled for client work. `AUTO_MIGRATE=true` is an explicit local convenience only; it is not the production deployment path.
 
 ## Production setup
 

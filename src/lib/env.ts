@@ -137,8 +137,9 @@ export const env = {
   },
 
   app: {
+    /** Account access is independent of demo delivery routing. */
     get demoLoginEnabled() {
-      return env.app.demoMode && optional("ENABLE_DEMO_LOGIN", process.env.NODE_ENV === "production" ? "false" : "true") === "true";
+      return optional("ENABLE_DEMO_LOGIN", process.env.NODE_ENV === "production" ? "false" : "true") === "true";
     },
     get url() {
       return optional("NEXT_PUBLIC_APP_URL", "http://localhost:3000").replace(/\/$/, "");

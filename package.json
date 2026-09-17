@@ -5,9 +5,11 @@
   "description": "AI content research and publishing agent — idea to reviewed, channel-ready, grounded content.",
   "scripts": {
     "dev": "next dev",
+    "dev:worker": "node scripts/dev-worker.cjs",
     "build": "next build",
     "start": "next start",
-    "lint": "next lint",
+    "lint": "tsc --noEmit",
+    "worker": "tsx --require ./scripts/stub-server-only.cjs scripts/worker.ts",
     "typecheck": "tsc --noEmit",
     "db:push": "tsx scripts/db-push.ts",
     "db:seed": "tsx --require ./scripts/stub-server-only.cjs scripts/seed.ts",
@@ -16,15 +18,18 @@
     "broken-pack": "tsx --require ./scripts/stub-server-only.cjs scripts/broken-input-pack.ts",
     "verify:selects": "tsx scripts/verify-selects.ts",
     "verify:schemas": "tsx --require ./scripts/stub-server-only.cjs scripts/verify-schemas.ts",
-    "verify:grants": "tsx scripts/verify-grants.ts"
+    "verify:grants": "tsx scripts/verify-grants.ts",
+    "verify:refactor": "tsx scripts/verify-refactor.ts",
+    "verify:server": "tsx scripts/smoke-server.ts",
+    "preview": "node scripts/preview.cjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.125.0",
     "@supabase/ssr": "^0.7.0",
     "@supabase/supabase-js": "^2.58.0",
-    "next": "15.5.9",
-    "react": "19.1.1",
-    "react-dom": "19.1.1",
+    "next": "15.5.24",
+    "react": "19.1.9",
+    "react-dom": "19.1.9",
     "resend": "^6.1.2",
     "server-only": "^0.0.1",
     "zod": "^4.1.11"
@@ -38,9 +43,14 @@
     "pg": "^8.16.3",
     "tsx": "^4.20.5",
     "typescript": "^5.9.2",
-    "vitest": "^3.2.4"
+    "vitest": "4.1.11"
   },
   "engines": {
-    "node": ">=20"
-  }
+    "node": "^22.12.0 || >=24.0.0"
+  },
+  "overrides": {
+    "postcss": "8.5.28",
+    "sharp": "0.35.4"
+  },
+  "packageManager": "npm@11.19.1"
 }

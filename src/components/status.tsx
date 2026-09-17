@@ -335,7 +335,7 @@ export function Cost({
       title={
         complete
           ? undefined
-          : "At least this much, one or more calls could not be written to the cost log, so the real total may be higher."
+          : "At least this much. An active or interrupted provider call has unconfirmed usage; its reserved allowance still counts against the budget."
       }
     >
       {complete ? "" : "at least "}

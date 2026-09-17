@@ -20,18 +20,6 @@ import {
 import type { BrandVoice, ContentRequest, OutlineSection } from "@/lib/db/types";
 import { brandVoiceBlock, PUNCTUATION_BLOCK } from "./prompts";
 
-/**
- * Angle planning. DESIGN.md §9, §2.2.
- *
- * Three ANGLES, not three articles: "Drafting three complete articles to throw
- * away two is roughly triple the cost of the most expensive step in the
- * pipeline for no extra information; the choice a human actually makes is
- * between directions, not between prose."
- *
- * Input is a compact digest of the selected sources, not the full corpus —
- * planning does not need it.
- */
-
 interface PlannedAngle {
   label: string;
   headline: string;
@@ -42,16 +30,6 @@ interface PlannedAngle {
   rationale: string;
 }
 
-/**
- * Structured outputs reject array length constraints entirely — `minItems`
- * other than 0 or 1 is refused with a 400, and `maxItems` is refused outright.
- * So the counts live in the DESCRIPTION (which the model reads) and in the
- * constraint check below (which decides).
- *
- * That is the §9 position anyway: "Constraints checked in code, not asked for
- * politely." A schema that could enforce the count would have been convenient;
- * this way the count is verified rather than assumed.
- */
 export const ANGLE_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -126,21 +104,10 @@ export interface SourceDigestEntry {
 
 export interface PlanResult {
   angles: PlannedAngle[];
-  /** Constraint violations that survived the retry — advisory, not blocking. */
+
   warnings: string[];
 }
 
-/**
- * Takes a usable keyword out of the headline the model actually wrote.
- *
- * The keyword must appear in the headline, so when the two disagree the
- * headline wins: it is the thing a reader sees, and the keyword is derived
- * from it. Prefers the longest run of the intended keyword's own words that
- * survives in the headline, so "expectations gap" against a headline about
- * "rejecting offers" still yields something related rather than arbitrary.
- *
- * Returns null when nothing usable remains, which is a real violation.
- */
 export function keywordFromHeadline(headline: string, intended: string): string | null {
   const stop = new Set([
     "the", "a", "an", "and", "or", "but", "for", "to", "of", "in", "on", "at",
@@ -159,9 +126,6 @@ export function keywordFromHeadline(headline: string, intended: string): string 
   const intendedWords = new Set(
     intended.toLowerCase().split(/\s+/).filter((w) => w && !stop.has(w)),
   );
-
-  // The longest contiguous run of two or three content words, preferring one
-  // that overlaps what the model meant the keyword to be.
   let best: { phrase: string; overlap: number } | null = null;
 
   for (let size = 3; size >= 2; size--) {
@@ -174,15 +138,10 @@ export function keywordFromHeadline(headline: string, intended: string): string 
 
       if (!best || overlap > best.overlap) best = { phrase, overlap };
     }
-    // A three-word phrase that shares a word with the intent beats a two-word
-    // one that does not, so only stop early on a genuine match.
     if (best && best.overlap > 0) break;
   }
 
   if (best && containsKeyword(headline, best.phrase)) return best.phrase;
-
-  // Fall back to the first two content words, which are in the headline by
-  // construction.
   const content = words.filter((w) => !stop.has(w));
   if (content.length >= 2) {
     const phrase = content.slice(0, 2).join(" ");
@@ -192,29 +151,11 @@ export function keywordFromHeadline(headline: string, intended: string): string 
   return null;
 }
 
-/**
- * A broken constraint, and whether asking again could fix it.
- *
- * The distinction is what stops the pipeline burning three planning calls on
- * a request that cannot succeed. "Your headline is missing its keyword" is a
- * rewrite away; "each angle must use two sources" is unanswerable when only
- * one source exists, and retrying it spends money to be told the same thing.
- */
 interface Violation {
   message: string;
   fixable: boolean;
 }
 
-/**
- * Produces exactly three angles and checks the §9 constraints IN CODE rather
- * than asking for them politely.
- *
- * A failed check retries with the violations named — twice, because the first
- * attempt often returns three rephrasings of one idea and needs to be told
- * precisely how. After three attempts the angles are surfaced anyway with a
- * warning: this is an advisory quality check, not a correctness gate, and
- * blocking the human here would be worse than showing them the options.
- */
 export async function planAngles(
   request: ContentRequest,
   voice: BrandVoice | null,
@@ -238,12 +179,7 @@ export async function planAngles(
         "A useful test: if two of your headlines could sit under the same subheading " +
         "of a single article, they are too close.\n\n" +
         "Hard rules:\n" +
-        /**
-         * The keyword rule is a LITERAL contiguous match, and the model was
-         * never told so. It invented four-word keywords like "time-to-hire
-         * process drag", wrote a natural headline, and failed its own
-         * constraint on three attempts in a row.
-         */
+
         "- The primary keyword MUST appear in the headline as a CONTIGUOUS phrase,\n" +
         "  word for word, in that order. This is a literal string check: a headline\n" +
         "  about 'hiring delays' does NOT satisfy the keyword 'hiring bottlenecks'.\n" +
@@ -262,26 +198,15 @@ export async function planAngles(
 
   const prompt = buildPlanPrompt(request, digest, replanNote);
   const context = { requestId: request.id, step: "plan", purpose: "propose three angles" };
-
-  // Two retries rather than one. The first attempt frequently returns three
-  // rephrasings of the same idea, and telling the model precisely how it was
-  // too similar usually fixes it — but only if it is asked again.
-  const MAX_ATTEMPTS = 3;
+  const MAX_ATTEMPTS = 2;
 
   type AngleSet = { angles: PlannedAngle[] };
-
-  // The best attempt so far, by violation count.
   let lastResult: AngleSet | null = null;
   let lastViolations: string[] = [];
-  // The attempt just rejected, which is what the retry note quotes back.
   let previousAttempt: AngleSet | null = null;
-  // Built from the FIXABLE violations only; empty on the first attempt.
   let retryNote = "";
 
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
-    // Annotated explicitly: `result` feeds `lastResult`, which feeds
-    // `buildRetryNote`, which is declared below — enough of a cycle that
-    // inference gives up and falls back to `any`.
     const result: CallResult<AngleSet> = await callStructured<AngleSet>({
       context,
       model: MODELS.planning,
@@ -298,17 +223,7 @@ export async function planAngles(
       return { angles: result.value.angles, warnings: [] };
     }
 
-    /**
-     * Only retry what a retry can fix.
-     *
-     * The waste this prevents: with two sources — one of them a sign-in page —
-     * "each angle must draw on two distinct sources" cannot be satisfied by
-     * any wording, so all three attempts failed the same check and burned
-     * three planning calls to arrive where the first one did.
-     *
-     * A violation the model cannot act on is a fact about the RESEARCH, not
-     * about the angles. Surface it once and stop.
-     */
+
     const fixable = violations.filter((v) => v.fixable);
 
     if (fixable.length === 0) {
@@ -326,20 +241,11 @@ export async function planAngles(
         warnings: violations.map((v) => v.message),
       };
     }
-
-    // Keep the BEST attempt, not the most recent one. A later try can come
-    // back worse, and handing the reviewer the worst of three because it
-    // happened to be last would be a strange way to end.
     if (lastResult === null || violations.length < lastViolations.length) {
       lastResult = result.value;
       lastViolations = violations.map((v) => v.message);
     }
-
-    // The retry prompt needs the attempt that was just rejected, whichever
-    // one is being kept, and only the parts it can actually act on.
     previousAttempt = result.value;
-    // Only the fixable ones go into the retry note: telling the model to use
-    // two sources when two do not exist is asking it to fail again.
     retryNote = buildRetryNote(fixable.map((v) => v.message), previousAttempt);
 
     await recordDiscarded(
@@ -347,26 +253,15 @@ export async function planAngles(
       MODELS.planning,
       result.usage,
       `Angle constraints violated: ${fixable.map((v) => v.message).join("; ")}`,
+      result.callId,
     );
   }
-
-  // Still failing after three attempts. The angles are surfaced anyway — this
-  // is an advisory quality check, not a correctness gate, and blocking the
-  // human here would be worse than showing them the options (§9).
   await logWarn(
-    "The angles are more similar than they should be, even after two rewrites. They are shown anyway so you can choose or re-plan.",
+    "The angles are more similar than they should be, after a rewrite. They are shown anyway so you can choose or re-plan.",
     { requestId: request.id, step: "plan", detail: { violations: lastViolations } },
   );
 
-  /**
-   * `lastResult` is only set after a call RETURNS. If every attempt threw —
-   * a provider timeout, a 429, the function being killed at its duration
-   * limit — the non-null assertion here crashed with "cannot read properties
-   * of null", which surfaced as a bare "the pipeline stopped advancing" and
-   * nothing in the log to explain it.
-   *
-   * An error a person can act on is the minimum owed here (§17).
-   */
+
   if (!lastResult) {
     throw new Error(
       "Angle planning could not complete: every attempt failed before returning a " +
@@ -377,14 +272,6 @@ export async function planAngles(
   return { angles: lastResult.angles, warnings: lastViolations };
 }
 
-/**
- * The retry instruction.
- *
- * Naming the rule that was broken is not enough when the failure is "these are
- * all the same piece" — the model needs to see what it wrote and be told to
- * move away from it. So the previous headlines go back in, with an explicit
- * demand for three different KINDS of article rather than three phrasings.
- */
 function buildRetryNote(
   violations: string[],
   previous: { angles: PlannedAngle[] } | null,
@@ -421,23 +308,12 @@ function buildRetryNote(
   return parts.join("\n");
 }
 
-/**
- * The §9 constraints, checked in code:
- *   · the primary keyword must appear in the headline
- *   · each angle must reference at least two distinct sources
- *   · two angles must not share more than 70% of their outline intents,
- *     measured by embedding the outlines and comparing
- */
 async function checkAngleConstraints(
   angles: PlannedAngle[],
   digest: SourceDigestEntry[],
   request: ContentRequest,
 ): Promise<Violation[]> {
   const violations: Violation[] = [];
-
-  // Counts the schema used to guarantee. Structured outputs reject array
-  // length constraints, so if these are not checked here they are not checked
-  // at all — and "three angles" would quietly become however many arrived.
   if (angles.length !== ANGLE_COUNT) {
     violations.push({
       message: `You returned ${angles.length} angle(s); exactly ${ANGLE_COUNT} are required.`,
@@ -459,19 +335,7 @@ async function checkAngleConstraints(
       });
     }
 
-    /**
-     * A keyword that is not in its headline is REPAIRED, not rejected.
-     *
-     * This burned all three planning attempts, twice, on separate requests:
-     * the model invents a phrase like "expectations gap", writes a good
-     * headline that does not contain it, and fails its own constraint. Three
-     * Haiku calls and 69 seconds to produce angles that were fine.
-     *
-     * The keyword is DERIVED data: it has to appear in the headline, so the
-     * headline is the source of truth and the keyword can be taken from it.
-     * Rewriting the whole plan because a derived field disagrees with the
-     * field it derives from is the wrong trade.
-     */
+
     if (!containsKeyword(angle.headline, angle.primaryKeyword)) {
       const repaired = keywordFromHeadline(angle.headline, angle.primaryKeyword);
       if (repaired) {
@@ -484,14 +348,7 @@ async function checkAngleConstraints(
       }
     }
 
-    /**
-     * "At least two sources" is only meaningful when there ARE two sources.
-     *
-     * A request built on one page cannot satisfy it, so the check would fail
-     * on every angle, every retry, forever — producing a wall of violations
-     * that says nothing except that research was thin. The requirement is
-     * therefore the lesser of the rule and what actually exists.
-     */
+
     const requiredSources = Math.min(MIN_SOURCES_PER_ANGLE, digest.length);
 
     const sources = new Set(
@@ -500,9 +357,6 @@ async function checkAngleConstraints(
     if (sources.size < requiredSources) {
       violations.push({
         message: `Angle ${i + 1} draws on ${sources.size} source(s); it must use at least ${requiredSources}.`,
-        // Fixable only if there is somewhere else to draw from. With one
-        // usable source no rewrite can satisfy this, and retrying spends
-        // money to be told the same thing.
         fixable: digest.length > sources.size,
       });
     }
@@ -515,9 +369,6 @@ async function checkAngleConstraints(
       });
     }
   });
-
-  // Overlap, measured rather than eyeballed. A failure to embed is not a
-  // reason to reject the angles — it is a check that could not run.
   try {
     const texts = angles.map((a) =>
       [a.headline, ...(a.outline ?? []).map((s) => `${s.heading}: ${s.intent}`)].join(" "),
@@ -536,16 +387,13 @@ async function checkAngleConstraints(
         if (similarity > MAX_ANGLE_OVERLAP) {
           violations.push({
             message: `Angles ${i + 1} and ${j + 1} are ${Math.round(similarity * 100)}% similar; they must differ by more than that to be a real choice.`,
-            // Three genuinely different angles need material to differ ABOUT.
-            // Off a single source they will always read alike, and asking
-            // again just pays for the same answer.
             fixable: digest.length >= MIN_SOURCES_PER_ANGLE,
           });
         }
       }
     }
-  } catch {
-    // Advisory check, and unavailable is not failed.
+  } catch (error) {
+    throw error;
   }
 
   return violations;
@@ -587,10 +435,6 @@ function buildPlanPrompt(
   return parts.join("\n");
 }
 
-/**
- * Builds the compact digest planning receives: title, site, a one-line summary
- * from the first excerpt, and the top three excerpt snippets each (§9).
- */
 export async function buildSourceDigest(requestId: string): Promise<SourceDigestEntry[]> {
   const db = serviceClient();
 
@@ -616,9 +460,6 @@ export async function buildSourceDigest(requestId: string): Promise<SourceDigest
     list.push({ id: row.id as string, text: row.text as string });
     bySource.set(row.source_id as string, list);
   }
-
-  // Labels must match what drafting will use, so they are assigned in the same
-  // order both times: source relevance, then excerpt ordinal.
   let excerptIndex = 0;
 
   return sources.map((source, i) => {
@@ -627,7 +468,6 @@ export async function buildSourceDigest(requestId: string): Promise<SourceDigest
       excerptIndex++;
       return { label: `E${excerptIndex}`, text: truncate(e.text, 220) };
     });
-    // Keep the running index aligned with the full excerpt set.
     excerptIndex += Math.max(0, list.length - 3);
 
     return {
@@ -645,16 +485,12 @@ function truncate(text: string, limit: number): string {
   return clean.length <= limit ? clean : `${clean.slice(0, limit)}…`;
 }
 
-/** Persists the three angles for gate one. */
 export async function saveAngles(
   requestId: string,
   angles: PlannedAngle[],
   excerptLabelToId: Map<string, string>,
 ): Promise<void> {
   const db = serviceClient();
-
-  // A re-plan replaces the previous set rather than accumulating: the reviewer
-  // is choosing between three options, not nine.
   await db.from(table("angles")).delete().eq("request_id", requestId).eq("chosen", false);
 
   const rows = angles.map((angle) => ({

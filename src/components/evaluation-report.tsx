@@ -1,4 +1,5 @@
 import type { Evaluation, JudgedCriterion } from "@/lib/db/types";
+import { editorialFeedback } from "@/lib/editorial-feedback";
 
 /**
  * The evaluation report. DESIGN.md §14.2.
@@ -228,23 +229,23 @@ export function EvaluationReport({ evaluation }: { evaluation: Evaluation | null
         </section>
       )}
 
-      {(evaluation.recommended_changes?.length ?? 0) > 0 && (
+      {(evaluation.recommended_changes ?? []).some(editorialFeedback) && (
         <section>
           <h4 className="tiny strong mb-1">Recommended changes</h4>
           {/* A numbered list, most important first. This was one dense
               paragraph of nine edits run together, which had to be unpicked
               before any of it could be acted on. */}
           <ol className="change-list">
-            {evaluation.recommended_changes!.map((change, i) => (
+            {evaluation.recommended_changes!.map(editorialFeedback).filter(Boolean).map((change, i) => (
               <li key={i}>{change}</li>
             ))}
           </ol>
         </section>
       )}
 
-      {evaluation.overall_note && (
+      {editorialFeedback(evaluation.overall_note) && (
         <p className="tiny muted mb-0" style={{ fontStyle: "italic" }}>
-          {evaluation.overall_note}
+          {editorialFeedback(evaluation.overall_note)}
         </p>
       )}
     </div>

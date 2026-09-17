@@ -25,7 +25,7 @@ export interface ExcerptLookup {
  * phrase the writer meant to appear, so dropping the whole marker would delete
  * words from the sentence and leave it ungrammatical.
  */
-function stripInternalMarkup(markdown: string): string {
+export function stripInternalMarkup(markdown: string): string {
   return (
     markdown
       // ((link: anchor | E8)) and the malformed ((link: anchor E8)) both keep

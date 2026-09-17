@@ -1,3 +1,5 @@
+import { cache } from "react";
+import { hasPublicApproval, mayShowPublicArticle } from "@/lib/publication";
 import { notFound } from "next/navigation";
 import type { Metadata } from "next";
 import { serviceClient, table } from "@/lib/db/client";
@@ -23,20 +25,20 @@ import type { ClaimMapEntry, FetchStatus, Source } from "@/lib/db/types";
  * migration (§19.4).
  */
 
-export const revalidate = 60;
+export const dynamic = "force-dynamic";
 
-const PUBLISHABLE = ["content_review", "scheduled", "publishing", "published"];
+const PUBLISHABLE = ["scheduled", "publishing", "published"];
 
-async function loadArticle(slug: string) {
+const loadArticle = cache(async (slug: string) => {
   const db = serviceClient();
 
   const { data: request } = await db
     .from(table("content_requests"))
-    .select("id, slug, status, updated_at")
+    .select("id, slug, status, updated_at, deleted_at")
     .eq("slug", slug)
     .maybeSingle();
 
-  if (!request || !PUBLISHABLE.includes(request.status as string)) return null;
+  if (!request || request.deleted_at || !PUBLISHABLE.includes(request.status as string)) return null;
 
   const { data: version } = await db
     .from(table("article_versions"))
@@ -48,7 +50,7 @@ async function loadArticle(slug: string) {
     .limit(1)
     .maybeSingle();
 
-  if (!version) return null;
+  if (!version || !mayShowPublicArticle(request.status as string, request.deleted_at as string | null, await hasPublicApproval(request.id as string, version.id as string))) return null;
 
   const { data: sources } = await db
     .from(table("sources"))
@@ -64,7 +66,7 @@ async function loadArticle(slug: string) {
     .maybeSingle();
 
   return { request, version, sources: sources ?? [], image };
-}
+});
 
 export async function generateMetadata({
   params,

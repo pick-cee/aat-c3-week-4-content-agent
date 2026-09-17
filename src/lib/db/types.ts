@@ -168,6 +168,9 @@ export interface ContentRequest {
   status: RequestStatus;
   current_step: PipelineStep | null;
   step_attempts: number;
+  retry_after?: string | null;
+  step_started_at?: string | null;
+  replan_note?: string | null;
   runner_lease_until: string | null;
   runner_lease_id: string | null;
   /** Which step owns the failure, so a retry resumes there (§17). */
@@ -180,9 +183,11 @@ export interface ContentRequest {
   budget_cents: number;
   estimated_cost_cents: number | null;
   actual_cost_cents: number;
+  reserved_cost_cents?: number;
   /** False → the UI renders "at least $X". DESIGN.md §5.3. */
   cost_complete: boolean;
   revision_rounds: number;
+  revision_parent_id?: string | null;
   replans: number;
   submit_token: string | null;
   publish_target: string | null;
@@ -334,6 +339,7 @@ export interface JudgedCriterion {
 }
 
 export interface ComputedChecks {
+  checkerVersion?: number;
   sourceGrounding: {
     markedSentences: number;
     factualSentences: number;
@@ -537,6 +543,9 @@ export interface ModelCall {
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
+  cache_creation_tokens?: number;
+  input_hash?: string | null;
+  response_json?: unknown;
   web_searches: number;
   cost_cents: number;
   outcome: ModelCallOutcome;
@@ -609,6 +618,29 @@ export interface Database {
       };
     };
     Functions: {
+      consume_rate_limit: { Args: { p_scope: string; p_scope_key: string; p_window: string; p_metric: string; p_limit: number }; Returns: { allowed: boolean; current: number } };
+      choose_content_image: { Args: { p_request_id: string; p_image_id: string | null; p_alt: string | null }; Returns: boolean };
+      reserve_model_call: { Args: { p_id: string; p_request_id: string; p_step: string; p_model: string; p_ceiling: number; p_monthly_limit: number; p_lease_id: string | null }; Returns: { allowed: boolean; spent?: number; budget?: number; scope?: string } };
+      review_content_article: { Args: { p_request_id: string; p_actor_id: string; p_decision: string; p_note: string }; Returns: boolean };
+      set_content_source: { Args: { p_request_id: string; p_source_id: string; p_actor_id: string; p_included: boolean; p_reason: string | null }; Returns: boolean };
+      reject_content_channel: { Args: { p_request_id: string; p_output_id: string; p_actor_id: string; p_note: string }; Returns: boolean };
+      stop_content_request: { Args: { p_request_id: string; p_actor_id: string; p_delete: boolean }; Returns: boolean };
+      approve_content_channel: {
+        Args: { p_request_id: string; p_output_id: string; p_actor_id: string; p_scheduled_for: string | null; p_note: string | null };
+        Returns: PublishQueueItem[];
+      };
+      save_content_edit: {
+        Args: { p_request_id: string; p_parent_id: string; p_body: string; p_title: string; p_headings: HeadingNode[]; p_word_count: number };
+        Returns: string;
+      };
+      record_model_call: {
+        Args: { p_call: Record<string, unknown>; p_complete: boolean };
+        Returns: number;
+      };
+      choose_content_angle: {
+        Args: { p_request_id: string; p_angle_id: string };
+        Returns: boolean;
+      };
       claim_request_lease: {
         Args: { p_request_id: string; p_lease_id: string; p_lease_secs?: number };
         Returns: ContentRequest;

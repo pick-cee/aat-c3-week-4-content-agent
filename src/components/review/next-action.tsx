@@ -22,7 +22,7 @@ export function NextAction({
   status: string;
   onOpenChannels: () => void;
 }) {
-  if (channelsLocked) return null;
+  if (channelsLocked || outputs.length === 0) return null;
 
   const undecided = outputs.filter((o) => o.status === "draft" || o.status === "format_failed");
   const approved = outputs.filter((o) => o.status === "approved");

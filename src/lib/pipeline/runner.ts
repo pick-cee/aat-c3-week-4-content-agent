@@ -12,10 +12,11 @@ import {
   stepScore,
 } from "./research";
 import { buildSourceDigest, planAngles, saveAngles } from "./planning";
-import { draftArticle, selectExcerptsForDrafting } from "./drafting";
-import { evaluateArticle, reviseArticle } from "./evaluation";
-import { adaptAllChannels } from "./adaptation";
+import { assignSlug, draftArticle, selectExcerptsForDrafting } from "./drafting";
+import { CHECKER_VERSION, evaluateArticle, reviseArticle } from "./evaluation";
+import { adaptChannel } from "./adaptation";
 import { findImageCandidates } from "./images";
+import { prepareMissingChannels } from "./channel-preparation";
 import { labelExcerpts, type LabelledExcerpt } from "./grounding";
 import { notifyTerminalFailure } from "@/lib/notify";
 import {
@@ -33,312 +34,101 @@ import type {
   RequestStatus,
 } from "@/lib/db/types";
 
-/**
- * The step runner. DESIGN.md §3.1.
- *
- * "No step runs inside the user's request. POST /api/runner advances ONE
- * request by exactly ONE step and returns."
- *
- * Driven by the client polling while a user is watching, and by the release
- * cron as a safety net when nobody is. Two runners never process the same
- * request: work is claimed with a conditional lease update, and no row
- * returned means another runner holds it.
- */
-
+import { withExecution, assertExecutionActive, executionLeaseId } from "./execution";
+import { isRetryableError, PermanentPipelineError } from "./errors";
+import { env } from "@/lib/env";
 export interface RunnerResult {
-  advanced: boolean;
-  requestId: string;
-  from: RequestStatus;
-  to: RequestStatus;
-  step: PipelineStep | null;
-  message: string;
-  /** True while more work remains, so the caller should poll again. */
-  more: boolean;
-  /**
-   * Set only when the last attempt failed and another is coming. The UI shows
-   * the count, because a retry the person cannot see is indistinguishable from
-   * a hang.
-   */
-  attempt?: { current: number; of: number } | null;
+  advanced: boolean; requestId: string; from: RequestStatus; to: RequestStatus;
+  step: PipelineStep | null; message: string; more: boolean;
+  retryAfterMs?: number; attempt?: { current: number; of: number } | null;
 }
+const RUNNING = new Set<RequestStatus>(["researching","drafting","evaluating","revising","adapting"]);
+export function willRetryAfterFailure(status: RequestStatus): boolean { return RUNNING.has(status); }
 
-/**
- * Advances one request by one step.
- *
- * Returns `advanced: false` without doing anything if another runner holds the
- * lease — that is a normal outcome, not an error (§3.1).
- */
-/**
- * How often a running step pushes its lease forward. Comfortably inside
- * RUNNER_LEASE_SECONDS so a single missed tick cannot lose the claim.
- */
-const LEASE_HEARTBEAT_MS = 20_000;
-
-export async function runStep(requestId: string): Promise<RunnerResult> {
+export async function runStep(requestId?: string): Promise<RunnerResult> {
   const db = serviceClient();
   const leaseId = randomToken(12);
-
-  const { data: claimed, error: claimError } = await db.rpc("claim_request_lease", {
-    p_request_id: requestId,
-    p_lease_id: leaseId,
-    p_lease_secs: RUNNER_LEASE_SECONDS,
-  });
-
-  /**
-   * No row means another runner holds it and this invocation does nothing.
-   *
-   * `claim_request_lease` returns a scalar composite, so a failed claim comes
-   * back as an OBJECT with every field null rather than as nothing. Checking
-   * the id is what makes the difference visible: a plain truthiness test on
-   * the object passes, which is how the publish worker ended up logging
-   * "channel_output <NULL> does not exist" on every empty sweep.
-   */
-  // `setof` returns an array; empty means the lease is held elsewhere.
-  const claimedRow = (Array.isArray(claimed) ? claimed[0] : claimed) as
-    | { id?: string }
-    | undefined;
-  if (claimError || !claimedRow?.id) {
-    /**
-     * "Another worker is already advancing this request" was asserted, never
-     * checked. A runner that DIED still holds its lease until it expires, so
-     * this sat on screen for six minutes while nothing was advancing anything.
-     *
-     * The lease is now bounded by the function's own ceiling, so a claim this
-     * old means the holder is gone rather than busy. Saying which is the
-     * difference between "wait" and "something is wrong".
-     */
-    const { data: row } = await db
-      .from(table("content_requests"))
-      .select("runner_lease_until")
-      .eq("id", requestId)
-      .maybeSingle();
-
-    const leaseUntil = row?.runner_lease_until as string | null | undefined;
-    const secondsLeft = leaseUntil
-      ? Math.max(0, Math.round((new Date(leaseUntil).getTime() - Date.now()) / 1000))
-      : 0;
-
-    return {
-      advanced: false,
-      requestId,
-      from: "draft",
-      to: "draft",
-      step: null,
-      message:
-        secondsLeft > 0
-          ? `A step is still running. It has up to ${secondsLeft}s left before it is retried.`
-          : "Picking this back up.",
-      more: true,
-    };
+  // There is exactly one claim, including for scheduler-selected work.
+  const claim = requestId
+    ? await db.rpc("claim_request_lease", { p_request_id: requestId, p_lease_id: leaseId, p_lease_secs: RUNNER_LEASE_SECONDS })
+    : await db.rpc("claim_next_runnable_request", { p_lease_id: leaseId, p_lease_secs: RUNNER_LEASE_SECONDS });
+  if (claim.error) throw new Error("Could not claim work: " + claim.error.message);
+  const request = (Array.isArray(claim.data) ? claim.data[0] : claim.data) as ContentRequest | undefined;
+  if (!request?.id) {
+    let status: RequestStatus = "draft";
+    if (requestId) {
+      const { data, error } = await db.from(table("content_requests")).select("status, deleted_at")
+        .eq("id",requestId).maybeSingle();
+      if (error) throw new Error("Could not read request progress: " + error.message);
+      if (data && !data.deleted_at) status = data.status;
+    }
+    return { advanced: false, requestId: requestId ?? "", from: status, to: status, step: null,
+      message: RUNNING.has(status) ? "Work is running in the background." : "No work is waiting.",
+      more: RUNNING.has(status), retryAfterMs: 3_000 };
   }
-
-  // `claimedRow`, not `claimed`: the RPC returns an ARRAY since it became
-  // `setof`, and casting the array itself to a row made every field
-  // undefined. The screen read "Nothing for the runner to do while the
-  // request is undefined" and the pipeline stopped dead.
-  const request = claimedRow as unknown as ContentRequest;
-
-  /**
-   * A claimed row without a status is not a row.
-   *
-   * The cast above is unchecked, and when it was pointed at the RPC's array
-   * wrapper every field read as undefined. The UI dutifully printed "Nothing
-   * for the runner to do while the request is undefined" and the pipeline
-   * stopped, with nothing in the log to say why. A cast that can be wrong
-   * deserves one assertion.
-   */
-  if (!request?.status) {
-    await db.rpc("release_request_lease", { p_request_id: requestId, p_lease_id: leaseId });
-    throw new Error(
-      `The runner claimed request ${requestId} but the row came back without a status. ` +
-        `Nothing was changed and the lease was released.`,
-    );
-  }
-
-  const from = request.status;
-
-  /**
-   * Keeps the claim alive while the step is genuinely working.
-   *
-   * The lease is deliberately short so a DEAD worker frees the request fast.
-   * That killed live work too: evaluation runs the grounding embeddings and
-   * then an Opus judge, which together outlast the lease, so it expired
-   * mid-step, another poller claimed the same request, and the step restarted.
-   * Six attempts, zero judge calls, four minutes on screen.
-   *
-   * A worker that dies stops calling this and its lease lapses on schedule,
-   * which is the distinction the timeout alone could not draw.
-   */
+  let leaseLost = false;
+  const assertActive = async () => {
+    if (leaseLost) throw new PermanentPipelineError("This worker no longer owns the request.");
+    const { data, error } = await db.from(table("content_requests"))
+      .select("status, deleted_at, runner_lease_id").eq("id", request.id).single();
+    if (error) throw new Error("Could not verify the worker lease: " + error.message);
+    if (data.runner_lease_id !== leaseId || data.deleted_at || !RUNNING.has(data.status)) {
+      leaseLost = true;
+      throw new PermanentPipelineError("The request was stopped or taken over by another worker.");
+    }
+  };
   const heartbeat = setInterval(() => {
-    void db
-      .rpc("renew_request_lease", {
-        p_request_id: requestId,
-        p_lease_id: leaseId,
-        p_lease_secs: RUNNER_LEASE_SECONDS,
-      })
-      .then(() => undefined, () => undefined);
-  }, LEASE_HEARTBEAT_MS);
-
+    void db.rpc("renew_request_lease", { p_request_id: request.id, p_lease_id: leaseId,
+      p_lease_secs: RUNNER_LEASE_SECONDS }).then(({ data, error }) => {
+        if (error || data !== true) leaseLost = true;
+      }, () => { leaseLost = true; });
+  }, 20_000);
   try {
-    const result = await advance(request);
-
+    return await withExecution(assertActive, async () => {
+      try {
+        if (request.step_attempts > MAX_STEP_ATTEMPTS) {
+          throw new PermanentPipelineError("This step was interrupted repeatedly. Saved work is intact. Check worker health before retrying.");
+        }
+        const result = await advance(request);
+        return { ...result, advanced: true, requestId: request.id, from: request.status };
+      } catch (error) {
+        // Cancellation wins. A late provider response cannot resurrect it.
+        await assertActive();
+        const to = await handleStepFailure(request, error);
+        const more = willRetryAfterFailure(to);
+        return { advanced: true, requestId: request.id, from: request.status, to,
+          step: request.current_step, message: error instanceof Error ? error.message : String(error),
+          more, retryAfterMs: more ? retryDelay(request.step_attempts) : undefined,
+          attempt: more ? { current: request.step_attempts, of: MAX_STEP_ATTEMPTS } : null };
+      }
+    }, leaseId);
+  } finally {
     clearInterval(heartbeat);
-    await db.rpc("release_request_lease", {
-      p_request_id: requestId,
-      p_lease_id: leaseId,
-    });
-
-    return { ...result, advanced: true, requestId, from };
-  } catch (err) {
-    clearInterval(heartbeat);
-    await db.rpc("release_request_lease", {
-      p_request_id: requestId,
-      p_lease_id: leaseId,
-    });
-
-    const to = await handleStepFailure(request, err);
-
-    /**
-     * `more` decides whether the client polls again, so it has to mean "a
-     * retry is actually coming", not "something went wrong".
-     *
-     * This returned `more: false` for every failure, including the retryable
-     * ones. The runner wrote "Trying again (attempt 1 of 3)" to the log and
-     * the poller — the only thing that performs that retry while someone is
-     * watching — stopped on the same response. The retry never happened. The
-     * request sat at `evaluating` looking busy, forever.
-     *
-     * A request left in a running state is one the runner intends to pick up
-     * again; a terminal state is not. Saying so honestly is what makes the
-     * retry real.
-     */
-    const willRetry = willRetryAfterFailure(to);
-
-    return {
-      advanced: true,
-      requestId,
-      from,
-      to,
-      step: (request.current_step as PipelineStep) ?? null,
-      message: err instanceof Error ? err.message : String(err),
-      more: willRetry,
-      attempt: willRetry
-        ? { current: request.step_attempts + 1, of: MAX_STEP_ATTEMPTS }
-        : null,
-    };
+    // Persist success/failure BEFORE releasing, so another worker never starts
+    // on the stale state while this worker is still recording its outcome.
+    const { error } = await db.rpc("release_request_lease", { p_request_id: request.id, p_lease_id: leaseId });
+    if (error) console.error("[runner] lease release failed", error.message);
   }
 }
-
-/**
- * States the runner will advance again. Anything else is terminal or waiting
- * on a person, and polling it would spin without ever changing.
- */
-const RETRYING_STATUSES = new Set<RequestStatus>([
-  "researching",
-  "drafting",
-  "evaluating",
-  "revising",
-  "adapting",
-]);
-
-/**
- * Whether a failure that left the request in `status` will actually be retried.
- *
- * Exported so the rule is testable directly: the bug it guards against was the
- * runner saying "trying again" while the poller stopped, and nothing in the
- * type system could catch a disagreement between those two.
- */
-export function willRetryAfterFailure(status: RequestStatus): boolean {
-  return RETRYING_STATUSES.has(status);
+function retryDelay(attempt: number) { return Math.min(60_000, 10_000 * 2 ** Math.max(0, attempt - 1)); }
+async function handleStepFailure(request: ContentRequest, error: unknown): Promise<RequestStatus> {
+  const budget = error instanceof BudgetExceededError;
+  const retry = !budget && isRetryableError(error) && request.step_attempts < MAX_STEP_ATTEMPTS;
+  const status = budget ? "budget_exceeded" : retry ? request.status : "failed";
+  const message = error instanceof Error ? error.message : String(error);
+  const { error: writeError } = await serviceClient().from(table("content_requests")).update({
+    status, failure_reason: message, failed_step: request.current_step,
+    failure_detail: { attempts: request.step_attempts, retryable: retry,
+      ...(budget ? { spentCents: error.spentCents, wouldSpendCents: error.wouldSpendCents, budgetCents: error.budgetCents } : {}) },
+    retry_after: retry ? new Date(Date.now() + retryDelay(request.step_attempts)).toISOString() : null,
+  }).eq("id",request.id).eq("runner_lease_id",request.runner_lease_id!).neq("status","cancelled");
+  if (writeError) throw new Error("Could not save the step failure: " + writeError.message);
+  await (retry ? logWarn : logError)(retry ? message + " A retry is scheduled." : message,
+    { requestId: request.id, step: request.current_step });
+  if (!retry) await notifyTerminalFailure(request.id, status, message).catch(() => undefined);
+  return status;
 }
 
-/**
- * Every failure sets a state naming the step, a plain-language reason, a
- * structured detail, an activity_log row, and an email if terminal (§17).
- *
- * A step that has exceeded max_step_attempts stops the request at `failed`
- * naming the step, rather than retrying forever on a schedule (§3.1).
- */
-async function handleStepFailure(
-  request: ContentRequest,
-  err: unknown,
-): Promise<RequestStatus> {
-  const db = serviceClient();
-  const step = (request.current_step as PipelineStep) ?? "discover";
-
-  // Budget is its own terminal state with the work so far intact (§18.4).
-  if (err instanceof BudgetExceededError) {
-    await db
-      .from(table("content_requests"))
-      .update({
-        status: "budget_exceeded",
-        failed_step: step,
-        failure_reason: err.message,
-        failure_detail: {
-          spentCents: err.spentCents,
-          wouldSpendCents: err.wouldSpendCents,
-          budgetCents: err.budgetCents,
-        },
-      })
-      .eq("id", request.id);
-
-    await logError(err.message, { requestId: request.id, step });
-    await notifyTerminalFailure(request.id, "budget_exceeded", err.message);
-    return "budget_exceeded";
-  }
-
-  const attempts = request.step_attempts + 1;
-  const message = err instanceof Error ? err.message : String(err);
-
-  if (attempts >= MAX_STEP_ATTEMPTS) {
-    await db
-      .from(table("content_requests"))
-      .update({
-        status: "failed",
-        step_attempts: attempts,
-        failed_step: step,
-        failure_reason: message,
-        failure_detail: { attempts, step },
-      })
-      .eq("id", request.id);
-
-    await logError(
-      `The ${stepLabel(step)} step failed ${attempts} times, so this request stopped there.`,
-      { requestId: request.id, step, detail: { error: message } },
-    );
-    await notifyTerminalFailure(request.id, "failed", message);
-    return "failed";
-  }
-
-  // Under the limit: record the attempt and leave the status alone so the next
-  // invocation resumes from stored state rather than starting over.
-  await db
-    .from(table("content_requests"))
-    .update({
-      step_attempts: attempts,
-      failure_reason: message,
-      failure_detail: { attempts, step },
-    })
-    .eq("id", request.id);
-
-  await logWarn(
-    // Says what is actually true. The retry is real — the poller calls the
-    // runner again and the step resumes from stored state — but the previous
-    // wording implied something was already happening, while the retry only
-    // fires on the next poll.
-    `${stepLabel(step)} did not complete. Trying again (attempt ${attempts} of ${MAX_STEP_ATTEMPTS}).`,
-    { requestId: request.id, step, detail: { error: message } },
-  );
-
-  return request.status;
-}
-
-/**
- * Names the computed checks that are still failing, in plain words.
- *
- * "It failed evaluation" tells a reviewer nothing they can act on. These are
- * measured facts, so they can be stated precisely.
- */
 function describeFailingChecks(computed: ComputedChecks): string[] {
   const failing: string[] = [];
 
@@ -351,7 +141,7 @@ function describeFailingChecks(computed: ComputedChecks): string[] {
   if (!computed.factualConsistency.passed) {
     failing.push(
       computed.factualConsistency.numberDisagreements > 0
-        ? `${computed.factualConsistency.numberDisagreements} figure(s) disagree with the source`
+        ? `${computed.factualConsistency.numberDisagreements} figure(s) could not be matched to the cited source`
         : `${computed.factualConsistency.unsupportedCandidates} claim(s) carry no citation`,
     );
   }
@@ -384,9 +174,6 @@ function stepLabel(step: PipelineStep | string): string {
     default: return String(step);
   }
 }
-
-// ─── The state machine ──────────────────────────────────────────────────────
-
 type Advance = Omit<RunnerResult, "advanced" | "requestId" | "from">;
 
 async function advance(request: ContentRequest): Promise<Advance> {
@@ -402,8 +189,6 @@ async function advance(request: ContentRequest): Promise<Advance> {
     case "adapting":
       return advanceAdapting(request);
     default:
-      // plan_review and content_review wait for a human; terminal states are
-      // done. Neither is an error.
       return {
         to: request.status,
         step: null,
@@ -413,7 +198,7 @@ async function advance(request: ContentRequest): Promise<Advance> {
   }
 }
 
-/** Research is four sub-steps, each resumable from what is in the table. */
+
 async function advanceResearch(request: ContentRequest): Promise<Advance> {
   const db = serviceClient();
   const step = (request.current_step as PipelineStep) ?? "discover";
@@ -422,7 +207,6 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
     const result = await stepDiscover(request);
 
     if (result.outcome === "no_sources_found") {
-      // Not a failure and not an empty article (§7.1).
       await setStatus(request.id, "needs_human", null, {
         research_outcome: "no_sources_found",
       });
@@ -452,7 +236,7 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
     const result = await stepFetch(request);
 
     if (!result.complete) {
-      await db.from(table("content_requests")).update({ step_attempts: 0 }).eq("id", request.id);
+      await setStatus(request.id, "researching", step);
       return {
         to: "researching",
         step: "fetch",
@@ -480,7 +264,6 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
     return {
       to: "researching",
       step: "chunk_embed",
-      // Partial research is a valid outcome and must LOOK like one (§7.3).
       message:
         assessment.failed > 0
           ? `Read ${assessment.usable} sources; ${assessment.failed} could not be read and are listed.`
@@ -493,7 +276,7 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
     const result = await stepChunkEmbed(request);
 
     if (!result.complete) {
-      await db.from(table("content_requests")).update({ step_attempts: 0 }).eq("id", request.id);
+      await setStatus(request.id, "researching", step);
       return {
         to: "researching",
         step: "chunk_embed",
@@ -509,16 +292,7 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
   if (step === "score") {
     await stepScore(request);
 
-    /**
-     * The last honest moment to stop.
-     *
-     * Everything up to here is cheap; everything after is not. Checking
-     * material AFTER indexing is what makes this reliable — `assessResearch`
-     * ran on fetch status, so a page that fetched cleanly but held no article
-     * still counted, and a request could reach planning with one real source
-     * behind two rows. It then failed repeatedly on material that was never
-     * there, which is expensive and looks like the system is broken.
-     */
+
     const material = await assessMaterial(request);
 
     if (!material.ok) {
@@ -543,8 +317,6 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
       more: true,
     };
   }
-
-  // plan — the last research step, which ends at gate one.
   const { voice } = await loadContext(request);
   const digest = await buildSourceDigest(request.id);
 
@@ -561,7 +333,7 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
     };
   }
 
-  const plan = await planAngles(request, voice, digest);
+  const plan = await planAngles(request, voice, digest, request.replan_note ?? undefined);
   await saveAngles(request.id, plan.angles, await excerptLabelMap(request.id));
   await setStatus(request.id, "plan_review", "plan");
 
@@ -574,12 +346,17 @@ async function advanceResearch(request: ContentRequest): Promise<Advance> {
 }
 
 async function advanceDrafting(request: ContentRequest): Promise<Advance> {
-  const { voice, angle } = await loadContext(request);
+  const { voice, angle, version } = await loadContext(request);
 
   if (!angle) {
     throw new Error("No angle was chosen, so there is nothing to draft.");
   }
 
+  if (version?.angle_id === angle.id) {
+    if (!request.slug) await assignSlug(request.id, version.title);
+    await setStatus(request.id, "evaluating", "evaluate");
+    return { to: "evaluating", step: "evaluate", message: "Saved draft recovered. Checking it now.", more: true };
+  }
   const excerpts = await selectExcerptsForDrafting(request, angle);
   if (excerpts.length === 0) {
     throw new Error(
@@ -603,7 +380,12 @@ async function advanceEvaluating(request: ContentRequest): Promise<Advance> {
 
   if (!version) throw new Error("There is no draft to evaluate.");
 
-  const evaluation = await evaluateArticle({
+  const saved = await serviceClient().from(table("evaluations")).select("*")
+    .eq("article_version_id", version.id).neq("status", "not_evaluated").order("created_at", { ascending: false }).limit(1).maybeSingle();
+  if (saved.error) throw new Error(saved.error.message);
+  const previous = saved.data as unknown as import("@/lib/db/types").Evaluation | null;
+  const [checked] = await Promise.allSettled([
+    previous?.computed?.checkerVersion === CHECKER_VERSION ? Promise.resolve(previous) : evaluateArticle({
     request,
     version,
     angle,
@@ -611,14 +393,14 @@ async function advanceEvaluating(request: ContentRequest): Promise<Advance> {
     excerpts,
     allowedUrls,
     channelsProduced: 0,
-  });
-
-  // An evaluation that could not run must never be treated as a pass (§5.8).
+    previousEvaluation: previous,
+  }),
+    // Free, bounded image discovery runs alongside checks, including drafts needing correction.
+    findImageCandidates(request, version),
+  ]);
+  if (checked.status === "rejected") throw checked.reason;
+  const evaluation = checked.value;
   if (evaluation.status === "not_evaluated") {
-    // The reason is kept in `evaluations.error` and the activity log for
-    // whoever debugs it; what surfaces on the request is what a content
-    // manager can act on. Nobody reviewing an article should have to read
-    // about token limits.
     throw new Error(
       "The quality check could not complete, so the draft was not approved, " +
         "an evaluation that did not happen is not a pass. Retrying usually clears it.",
@@ -634,17 +416,12 @@ async function advanceEvaluating(request: ContentRequest): Promise<Advance> {
       more: true,
     };
   }
-
-  // Two revision rounds, then needs_human. It never loops (§2.7).
+  if (version.origin === "human_edit") {
+    await setStatus(request.id, "needs_human", "evaluate", { failure_reason: "Your edit is saved. Some checks need review; accept it with a note, edit it again, or explicitly request a revision." });
+    return { to: "needs_human", step: "evaluate", message: "Your edit needs review.", more: false };
+  }
   if (request.revision_rounds >= MAX_REVISION_ROUNDS) {
-    /**
-     * The reason is STORED, not just emailed.
-     *
-     * This was the one needs_human path that recorded nothing, so the request
-     * page said "No reason was recorded, which is itself worth reporting" and
-     * offered only Cancel, on the case where a finished draft is sitting there
-     * waiting for a judgement call.
-     */
+
     const failing = evaluation.computed
       ? describeFailingChecks(evaluation.computed)
       : [];
@@ -675,7 +452,7 @@ async function advanceEvaluating(request: ContentRequest): Promise<Advance> {
     };
   }
 
-  await setStatus(request.id, "revising", "revise");
+  await setStatus(request.id, "revising", "revise", { revision_parent_id: version.id });
   return {
     to: "revising",
     step: "revise",
@@ -690,6 +467,10 @@ async function advanceRevising(request: ContentRequest): Promise<Advance> {
 
   if (!version) throw new Error("There is no draft to revise.");
 
+  if (version.origin === "revision" && version.parent_version_id === request.revision_parent_id) {
+    await setStatus(request.id, "evaluating", "evaluate", { revision_rounds: request.revision_rounds + 1 });
+    return { to: "evaluating", step: "evaluate", message: "Saved revision recovered.", more: true };
+  }
   const { data: evaluationRow } = await db
     .from(table("evaluations"))
     .select("*")
@@ -709,15 +490,7 @@ async function advanceRevising(request: ContentRequest): Promise<Advance> {
     excerpts,
   );
 
-  await db
-    .from(table("content_requests"))
-    .update({
-      revision_rounds: request.revision_rounds + 1,
-      status: "evaluating",
-      current_step: "evaluate",
-      step_attempts: 0,
-    })
-    .eq("id", request.id);
+  await setStatus(request.id, "evaluating", "evaluate", { revision_rounds: request.revision_rounds + 1 });
 
   return {
     to: "evaluating",
@@ -729,28 +502,16 @@ async function advanceRevising(request: ContentRequest): Promise<Advance> {
 
 async function advanceAdapting(request: ContentRequest): Promise<Advance> {
   const { voice, version } = await loadContext(request);
-  if (!version) throw new Error("There is no article to adapt.");
-
-  const results = await adaptAllChannels(request, version, voice);
-
-  // Optional, and never blocking (§13).
-  await findImageCandidates(request, version);
-
+  if (!version) throw new PermanentPipelineError("There is no article to adapt.");
+  const { data, error } = await serviceClient().from(table("channel_outputs"))
+    .select("channel, status").eq("article_version_id", version.id);
+  if (error) throw new Error(error.message);
+  await prepareMissingChannels(request.channels, (data ?? []).map(o => o.channel), channel =>
+    adaptChannel(request, version, voice, channel, request.slug ? env.app.url + "/a/" + request.slug : null));
+  // Image candidates were prepared alongside evaluation; selection is optional at review.
   await setStatus(request.id, "content_review", "adapt");
-
-  const failed = results.filter((r) => r.formatFailed).length;
-  return {
-    to: "content_review",
-    step: "adapt",
-    message:
-      failed === 0
-        ? "Everything is ready for review."
-        : `Ready for review. ${failed} channel(s) need attention.`,
-    more: false,
-  };
+  return { to: "content_review", step: "adapt", message: "Your content is ready to review.", more: false };
 }
-
-// ─── Shared loading ─────────────────────────────────────────────────────────
 
 interface StepContext {
   voice: BrandVoice | null;
@@ -760,12 +521,7 @@ interface StepContext {
   allowedUrls: string[];
 }
 
-/**
- * Loads everything a generation step needs. The excerpt set is rebuilt from
- * `excerpt_ids_used` on the version, so evaluation and revision see exactly
- * the same labelled set the draft was written from — a different set would
- * make every marker resolve differently.
- */
+
 async function loadContext(request: ContentRequest): Promise<StepContext> {
   const db = serviceClient();
 
@@ -783,13 +539,15 @@ async function loadContext(request: ContentRequest): Promise<StepContext> {
       .maybeSingle(),
   ]);
 
+  for (const result of [voiceResult, angleResult, versionResult]) { if (result.error) throw new Error("Could not load pipeline context: " + result.error.message); }
   const version = (versionResult.data as unknown as ArticleVersion | null) ?? null;
 
-  const { data: sources } = await db
+  const { data: sources, error: sourceError } = await db
     .from(table("sources"))
     .select("id, title, url, site_name, published_at, included, fetch_status")
     .eq("request_id", request.id);
 
+  if (sourceError) throw new Error("Could not load sources: " + sourceError.message);
   const sourceMap = new Map(
     (sources ?? []).map((s) => [
       s.id as string,
@@ -805,12 +563,11 @@ async function loadContext(request: ContentRequest): Promise<StepContext> {
   let excerpts: LabelledExcerpt[] = [];
 
   if (version && version.excerpt_ids_used.length > 0) {
-    const { data: rows } = await db
+    const { data: rows, error: excerptError } = await db
       .from(table("excerpts"))
       .select("id, source_id, text, heading_path, ordinal, embedding")
       .in("id", version.excerpt_ids_used);
-
-    // Restored in the order the draft saw them, so E1 is still E1.
+    if (excerptError || rows?.length !== version.excerpt_ids_used.length) throw new PermanentPipelineError("The saved source ledger is incomplete. Restore the source excerpts before continuing.");
     const byId = new Map((rows ?? []).map((r) => [r.id as string, r]));
     const ordered = version.excerpt_ids_used
       .map((id) => byId.get(id))
@@ -841,7 +598,7 @@ async function loadContext(request: ContentRequest): Promise<StepContext> {
   };
 }
 
-/** Maps the E-labels planning used back to real excerpt ids. */
+
 async function excerptLabelMap(requestId: string): Promise<Map<string, string>> {
   const db = serviceClient();
 
@@ -865,8 +622,6 @@ async function excerptLabelMap(requestId: string): Promise<Map<string, string>> 
     list.push(row.id as string);
     bySource.set(row.source_id as string, list);
   }
-
-  // Must mirror buildSourceDigest's numbering exactly.
   const map = new Map<string, string>();
   let index = 0;
   for (const source of sources ?? []) {
@@ -885,10 +640,15 @@ async function setStatus(
   step: PipelineStep | null,
   extra: Record<string, unknown> = {},
 ): Promise<void> {
-  await serviceClient()
+  await assertExecutionActive();
+  let update = serviceClient()
     .from(table("content_requests"))
-    .update({ status, current_step: step, step_attempts: 0, ...extra })
-    .eq("id", requestId);
+    .update({ status, current_step: step, step_attempts: 0, retry_after: null, failure_reason: null, failure_detail: null, ...extra })
+    .eq("id", requestId).neq("status", "cancelled").is("deleted_at", null);
+  const leaseId = executionLeaseId();
+  if (leaseId) update = update.eq("runner_lease_id", leaseId);
+  const { data, error } = await update.select("id").maybeSingle();
+  if (error || !data) throw new Error("Could not save pipeline progress: " + (error?.message ?? "The request changed or its lease was lost."));
 
   await logInfo(`→ ${status}${step ? ` (${stepLabel(step)})` : ""}`, {
     requestId,

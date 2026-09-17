@@ -57,11 +57,14 @@ export async function confirmHandoff(
   if (item.kind !== "handoff") {
     return { ok: false, error: "This channel is not posted by hand." };
   }
+  if (item.status !== "awaiting_manual_post") {
+    return { ok: false, error: "This handoff is no longer awaiting confirmation. Check the publishing queue." };
+  }
 
   // Only a person confirming with a URL makes it `posted_manually`, which
   // stays visibly distinct from `published` everywhere (§2.9). The check
   // constraint on the table enforces that a handoff can never be `published`.
-  const { error } = await db
+  const { data: confirmed, error } = await db
     .from(table("publish_queue"))
     .update({
       status: "posted_manually",
@@ -72,9 +75,16 @@ export async function confirmHandoff(
     .eq("id", item.id)
     // Guard against two people confirming at once: only a row that has not
     // already been confirmed is updated.
-    .neq("status", "posted_manually");
+    .eq("status", "awaiting_manual_post")
+    .select("id")
+    .maybeSingle();
 
   if (error) return { ok: false, error: `Could not record it: ${error.message}` };
+  if (!confirmed) {
+    const latest = await db.from(table("publish_queue")).select("status").eq("id", item.id).maybeSingle();
+    if (!latest.error && latest.data?.status === "posted_manually") return { ok: true };
+    return { ok: false, error: "This handoff changed before confirmation. Refresh to see its current status." };
+  }
 
   await logInfo(
     `A person confirmed the ${item.channel} post is live. This is recorded as posted by hand, not as published by the system.`,

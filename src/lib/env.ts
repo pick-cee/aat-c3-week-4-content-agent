@@ -37,10 +37,10 @@ function optional(key: string, fallback = ""): string {
 function optionalInt(key: string, fallback: number): number {
   const raw = process.env[key]?.trim();
   if (!raw) return fallback;
-  const parsed = Number.parseInt(raw, 10);
+  const parsed = Number(raw);
   // A malformed number in config is a mistake worth surfacing, not one to
   // paper over with a default that silently differs from what was written.
-  if (!Number.isFinite(parsed)) {
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
     throw new Error(`Environment variable ${key} must be an integer, got "${raw}".`);
   }
   return parsed;
@@ -137,6 +137,9 @@ export const env = {
   },
 
   app: {
+    get demoLoginEnabled() {
+      return env.app.demoMode && optional("ENABLE_DEMO_LOGIN", process.env.NODE_ENV === "production" ? "false" : "true") === "true";
+    },
     get url() {
       return optional("NEXT_PUBLIC_APP_URL", "http://localhost:3000").replace(/\/$/, "");
     },

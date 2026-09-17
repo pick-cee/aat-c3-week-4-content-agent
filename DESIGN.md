@@ -6,6 +6,53 @@ purpose, with a reason.
 
 ---
 
+## September 2026 production refactor (supersedes conflicting sections below)
+
+See `REFACTOR.md` for the implementation, verified checks, local test setup and
+remaining release checks. These amendments also supersede older model-routing,
+automatic-startup, public-draft and image-generation requirements in the
+historical sections below. The source ledger and human approval gates remain.
+
+The original execution budget and scheduler cannot support the measured calls.
+The runner now performs one resumable unit under one database lease, records
+attempts before work, and releases only after the outcome is persisted. A
+background drain advances units immediately; a continuously running worker is
+the recommended production driver. The browser observes progress and can wake
+idle work, but closing it does not cancel a job. GitHub Actions is a five-minute
+recovery sweep, not a punctual scheduler. Next routes allow 300 seconds; provider
+calls have shorter explicit deadlines and no hidden SDK retries.
+
+Sonnet writes and judges, with thinking disabled for these bounded editorial
+tasks. Haiku plans and adapts. Prompts and output limits are bounded; a compact
+drafting corpus replaces the former 12,000-token allowance. Metadata is derived
+from the article without a second model. Saved drafts, completed evaluations and
+channel outputs are reused on recovery. Each channel is its own resumable unit.
+Optional image discovery never holds the article behind a loading screen.
+
+Accounting distinguishes uncached input, cache writes and cache reads. Discarding
+an output changes the original call record; it does not bill it a second time.
+Unknown provider usage is marked incomplete. Embedding batches are budget checked
+and logged individually. Model responses are checkpointed for retry reuse.
+
+The database reserves the estimated call allowance before external work begins,
+including across concurrent calls and the workspace monthly limit. Confirmed
+receipts replace reservations; interrupted calls retain an explicit allowance.
+Review and cancellation transitions are transactional and check the latest
+version. Demo credentials have no direct database read access.
+
+The workspace uses persistent navigation, a searchable content library with
+working filters, a focused creation brief, visible progress and an article that
+can be read as soon as the first draft is saved. Review and publishing remain
+separate decisions. Public article URLs require approval of that exact version;
+unapproved drafts and recycled requests are private.
+
+This remains a single-agency application. Production sign-in uses provisioned
+Supabase accounts; demo access is explicitly gated and cannot enter a live-send
+workspace. Production startup does not seed demo users or migrate the database.
+Apply migrations during deployment before starting web and worker processes.
+
+---
+
 ## 1. What this is
 
 A content manager at a marketing agency submits an idea. The system researches

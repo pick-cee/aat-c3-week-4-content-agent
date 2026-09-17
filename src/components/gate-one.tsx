@@ -63,9 +63,11 @@ export function GateOne({
   function act(fn: () => Promise<{ ok: boolean; error?: string }>) {
     setError(null);
     startTransition(async () => {
-      const result = await fn();
-      if (!result.ok) setError(result.error ?? "That did not work.");
-      else router.refresh();
+      try {
+        const result = await fn();
+        if (!result.ok) setError(result.error ?? "That did not work.");
+        else router.refresh();
+      } catch { setError("Connection interrupted. Refresh to check the saved state before trying again."); }
     });
   }
 

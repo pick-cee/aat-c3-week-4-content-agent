@@ -54,6 +54,24 @@ describe("extractSignificantNumbers", () => {
 });
 
 describe("citedTextStatesNumber", () => {
+  it("recognises the written percentage that blocked the saved article", () => {
+    const source = "Sixty-seven percent of HR leaders find skills harder to verify. Eighty-four percent report heavier workloads.";
+    expect(citedTextStatesNumberForTest(source, "84%")).toBe(true);
+    expect(citedTextStatesNumberForTest(source, "67%")).toBe(true);
+    expect(citedTextStatesNumberForTest(source, "85%")).toBe(false);
+  });
+
+  it("checks written figures in the article too", () => {
+    expect(extractSignificantNumbersForTest("Eighty-four per cent report more work. [E17]")).toEqual(["84%"]);
+    expect(extractSignificantNumbersForTest("One hundred and twenty-five applications arrived.")).toEqual(["125"]);
+  });
+
+  it("does not confuse a substring or a count with a percentage", () => {
+    expect(citedTextStatesNumberForTest("184% growth", "84%")).toBe(false);
+    expect(citedTextStatesNumberForTest("84 applicants", "84%")).toBe(false);
+    expect(citedTextStatesNumberForTest("84% of applicants", "84")).toBe(false);
+  });
+
   it("matches a figure written identically", () => {
     expect(citedTextStatesNumberForTest("churn was 26% last year", "26%")).toBe(true);
   });

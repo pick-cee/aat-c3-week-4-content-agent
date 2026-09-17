@@ -60,6 +60,10 @@ export async function runRelease(): Promise<ReleaseResult> {
     reminded: 0,
     messages: [],
   };
+  if (process.env.DISABLE_PUBLISHING === "true") {
+    result.messages.push("Publishing is paused for this environment.");
+    return result;
+  }
 
   // The watchdog runs first, so a row stuck from the previous invocation is
   // resolved before new work is claimed.

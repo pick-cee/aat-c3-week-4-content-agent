@@ -10,7 +10,7 @@ import { SourcesPanel } from "./review/sources-panel";
 import { VersionsPanel } from "./review/versions-panel";
 import { NextAction } from "./review/next-action";
 import { TabButton, type Tab } from "./review/tab-button";
-import { buildExcerptLookup } from "./review/excerpt-lookup";
+import { buildExcerptLookup, type ReviewExcerpt } from "./review/excerpt-lookup";
 import { useAction } from "./review/use-action";
 import { isArticleLocked, areChannelsLocked } from "@/lib/pipeline/review-locks";
 import type {
@@ -53,6 +53,7 @@ export function GateTwo({
   outputs,
   images,
   sources,
+  excerpts,
   canApprove,
 }: {
   request: ContentRequest;
@@ -62,6 +63,7 @@ export function GateTwo({
   outputs: ChannelOutput[];
   images: ImageCandidate[];
   sources: Source[];
+  excerpts: ReviewExcerpt[];
   canApprove: boolean;
 }) {
   /**
@@ -79,7 +81,7 @@ export function GateTwo({
    * Channels while a decision is outstanding; the draft when everything is
    * decided, because then the article is the only thing left to look at.
    */
-  const anythingUndecided = outputs.some(
+  const anythingUndecided = outputs.filter(o => o.article_version_id === version.id).some(
     (o) => o.status === "draft" || o.status === "format_failed",
   );
   const [tab, setTab] = useState<Tab>(anythingUndecided ? "channels" : "draft");
@@ -96,14 +98,14 @@ export function GateTwo({
   // The latest output per channel: re-adaptation creates a new version rather
   // than overwriting.
   const latestOutputs = Object.values(
-    outputs.reduce<Record<string, ChannelOutput>>((acc, output) => {
+    outputs.filter(o => o.article_version_id === version.id).reduce<Record<string, ChannelOutput>>((acc, output) => {
       const existing = acc[output.channel];
       if (!existing || output.version > existing.version) acc[output.channel] = output;
       return acc;
     }, {}),
   );
 
-  const excerptLookup = buildExcerptLookup(sources);
+  const excerptLookup = buildExcerptLookup(sources, excerpts);
 
   /**
    * Whether the ARTICLE is closed for editing.

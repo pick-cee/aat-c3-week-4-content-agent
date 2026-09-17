@@ -1,4 +1,7 @@
 import "server-only";
+import { randomUUID } from "node:crypto";
+import { env } from "@/lib/env";
+import { assertExecutionActive, executionLeaseId } from "@/lib/pipeline/execution";
 import { serviceClient, table } from "@/lib/db/client";
 import { logError, logWarn } from "@/lib/log";
 import {
@@ -10,43 +13,27 @@ import {
 } from "@/lib/constants";
 import type { ModelCallOutcome } from "@/lib/db/types";
 
-/**
- * Cost accounting and budget enforcement.
- *
- * Two rules from DESIGN.md drive this file:
- *
- *   Rule 10 — every model call is logged, including discarded ones. A rejected
- *   draft spent real money. `article_versions` keeps what survived;
- *   `model_calls` keeps what was spent.
- *
- *   §18.4 — budget is checked BEFORE every call, against that call's worst
- *   case (assembled input tokens + max_tokens at the output rate). Checking
- *   after the fact is not a budget, it is a receipt.
- */
-
 export interface TokenUsage {
   inputTokens: number;
   outputTokens: number;
   cacheReadTokens?: number;
+  cacheCreationTokens?: number;
   webSearches?: number;
 }
 
-/** Dollars → cents, kept as a float; rounding happens once, at the database. */
 export function priceModelCall(model: string, usage: TokenUsage): number {
   const prices = MODEL_PRICES[model as ModelId];
   if (!prices) {
-    // An unpriced model is a costing bug, not a free call. Surfacing it as a
-    // warning and charging zero would make the total quietly wrong, so this
-    // throws and the caller records the call with cost_complete = false.
     throw new UnpricedModelError(model);
   }
 
-  const inputCost = ((usage.inputTokens - (usage.cacheReadTokens ?? 0)) / 1e6) * prices.input;
+  const inputCost = (usage.inputTokens / 1e6) * prices.input;
   const cacheCost = ((usage.cacheReadTokens ?? 0) / 1e6) * prices.cacheRead;
   const outputCost = (usage.outputTokens / 1e6) * prices.output;
   const searchCost = (usage.webSearches ?? 0) * WEB_SEARCH_PRICE_PER_SEARCH;
 
-  return (inputCost + cacheCost + outputCost + searchCost) * 100;
+  const cacheWriteCost = ((usage.cacheCreationTokens ?? 0) / 1e6) * prices.input * 1.25;
+  return (inputCost + cacheCost + cacheWriteCost + outputCost + searchCost) * 100;
 }
 
 export class UnpricedModelError extends Error {
@@ -67,10 +54,6 @@ export function priceScrapes(credits: number): number {
   return credits * FIRECRAWL_PRICE_PER_CREDIT * 100;
 }
 
-/**
- * The worst case for a call that has not happened yet: every input token
- * charged at full rate, and `max_tokens` all returned.
- */
 export function estimateWorstCase(
   model: string,
   inputTokens: number,
@@ -84,8 +67,6 @@ export function estimateWorstCase(
   });
 }
 
-// ─── Budget enforcement ─────────────────────────────────────────────────────
-
 export class BudgetExceededError extends Error {
   constructor(
     public readonly requestId: string,
@@ -93,13 +74,10 @@ export class BudgetExceededError extends Error {
     public readonly wouldSpendCents: number,
     public readonly budgetCents: number,
   ) {
-    // Says what happened, what it would take, and what to do. A budget refusal
-    // is permanent until someone changes the budget — never implying a retry
-    // would help is the whole point.
     super(
       `This step needs about ${formatCents(wouldSpendCents)} and only ` +
         `${formatCents(Math.max(0, budgetCents - spentCents))} of the ` +
-        `${formatCents(budgetCents)} budget is left (${formatCents(spentCents)} spent). ` +
+        `${formatCents(budgetCents)} budget is left (${formatCents(spentCents)} spent or reserved). ` +
         `Everything produced so far is saved. Raise the budget for this request to ` +
         `about ${formatCents(spentCents + wouldSpendCents)} and run it again to continue.`,
     );
@@ -107,38 +85,47 @@ export class BudgetExceededError extends Error {
   }
 }
 
-/**
- * Called before every model call. Throws rather than returning a boolean so a
- * forgotten check is a missing call site, not an ignored return value.
- */
 export async function assertWithinBudget(
   requestId: string,
   wouldSpendCents: number,
 ): Promise<void> {
+  await assertExecutionActive();
   const db = serviceClient();
   const { data, error } = await db
     .from(table("content_requests"))
-    .select("actual_cost_cents, budget_cents, cost_complete")
+    .select("actual_cost_cents, budget_cents, cost_complete, reserved_cost_cents")
     .eq("id", requestId)
     .single();
 
   if (error || !data) {
-    // Fail closed. A budget that cannot be read is not a budget of infinity.
     throw new Error(
       `Could not read the budget for request ${requestId}, so the call was not made. ` +
         `(${error?.message ?? "no row"})`,
     );
   }
 
-  const spent = data.actual_cost_cents ?? 0;
+  const spent = Number(data.actual_cost_cents ?? 0) + Number(data.reserved_cost_cents ?? 0);
   if (spent + wouldSpendCents > data.budget_cents) {
     throw new BudgetExceededError(requestId, spent, wouldSpendCents, data.budget_cents);
   }
 }
 
-// ─── Recording ──────────────────────────────────────────────────────────────
+export async function reserveModelCall(id: string, requestId: string, step: string, model: string, ceiling: number): Promise<void> {
+  await assertExecutionActive();
+  const { data, error } = await serviceClient().rpc("reserve_model_call", { p_id: id, p_request_id: requestId, p_step: step, p_model: model, p_ceiling: ceiling, p_monthly_limit: env.limits.monthlyCapCents, p_lease_id: executionLeaseId() ?? null });
+  if (error || !data) throw new Error("Could not reserve the provider budget: " + (error?.message ?? "no result"));
+  if (!data.allowed) {
+    if (data.scope === "workspace") throw new Error("The workspace monthly spending limit has been reached. No provider call was made.");
+    throw new BudgetExceededError(requestId, Number(data.spent), ceiling, Number(data.budget));
+  }
+}
 
 export interface RecordCallInput {
+  id?: string;
+  inputHash?: string;
+  response?: unknown;
+  usageKnown?: boolean;
+  costCeilingCents?: number;
   requestId: string | null;
   step: string;
   purpose?: string;
@@ -147,85 +134,43 @@ export interface RecordCallInput {
   outcome: ModelCallOutcome;
   error?: string;
   latencyMs?: number;
-  /** Pre-computed cost, for non-model spend (embeddings, scrapes). */
+
   costCentsOverride?: number;
 }
 
-/**
- * Records a call and adds its cost to the request total.
- *
- * If this insert fails, the request's `cost_complete` goes false and every
- * display of that total reads "at least $X" rather than a smaller confident
- * number (§5.3). That is the honest response to a missing row: the money was
- * still spent, and pretending otherwise understates it.
- */
 export async function recordModelCall(input: RecordCallInput): Promise<number> {
   const db = serviceClient();
-
-  let costCents = input.costCentsOverride ?? 0;
-  let priceKnown = true;
-
-  if (input.costCentsOverride === undefined) {
-    try {
-      costCents = priceModelCall(input.model, input.usage);
-    } catch (err) {
-      priceKnown = false;
-      costCents = 0;
-      await logWarn(
-        `Spent money on ${input.model} but have no price for it, so the total is understated.`,
-        { requestId: input.requestId, step: input.step, detail: { error: String(err) } },
-      );
-    }
-  }
-
-  const { error } = await db.from(table("model_calls")).insert({
-    request_id: input.requestId,
-    step: input.step,
-    purpose: input.purpose ?? null,
-    model: input.model,
-    input_tokens: input.usage.inputTokens,
-    output_tokens: input.usage.outputTokens,
+  const costCents = input.costCentsOverride ?? priceModelCall(input.model, input.usage);
+  const record = {
+    id: input.id ?? randomUUID(), request_id: input.requestId, step: input.step,
+    purpose: input.purpose ?? null, model: input.model,
+    input_tokens: input.usage.inputTokens, output_tokens: input.usage.outputTokens,
     cache_read_tokens: input.usage.cacheReadTokens ?? 0,
-    web_searches: input.usage.webSearches ?? 0,
-    cost_cents: costCents,
-    outcome: input.outcome,
-    error: input.error ?? null,
-    latency_ms: input.latencyMs ?? null,
-  });
-
-  if (error) {
-    await logError(
-      "A model call could not be written to the cost log, so this request's total is incomplete.",
-      { requestId: input.requestId, step: input.step, detail: { error: error.message } },
-    );
-  }
-
-  if (input.requestId) {
-    // `complete` false is sticky in the database function: once a total might
-    // be missing a call, it can never quietly become confident again.
-    const { error: costError } = await db.rpc("add_request_cost", {
-      p_request_id: input.requestId,
-      p_cents: costCents,
-      p_complete: !error && priceKnown,
+    cache_creation_tokens: input.usage.cacheCreationTokens ?? 0,
+    web_searches: input.usage.webSearches ?? 0, cost_cents: costCents,
+    outcome: input.outcome, error: input.error ?? null, latency_ms: input.latencyMs ?? null,
+    input_hash: input.inputHash ?? null, response_json: input.response ?? null,
+    cost_ceiling_cents: input.costCeilingCents ?? 0,
+  };
+  // One transaction records the call, its checkpoint and its cost. The UUID
+  // makes retrying a failed accounting write safe, with no duplicate charge.
+  let error: { message: string } | null = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const result = await db.rpc("record_model_call", {
+      p_call: record, p_complete: input.usageKnown !== false,
     });
-    if (costError) {
-      await logError("Could not add this call's cost to the request total.", {
-        requestId: input.requestId,
-        step: input.step,
-        detail: { error: costError.message },
-      });
-    }
+    error = result.error;
+    if (!error) return costCents;
   }
-
-  return costCents;
+  if (input.requestId) {
+    await db.from(table("content_requests")).update({ cost_complete: false }).eq("id", input.requestId);
+  }
+  await logError("Could not save the provider receipt. Work stopped to protect the budget.", {
+    requestId: input.requestId, step: input.step, detail: { error: error?.message, callId: record.id },
+  });
+  throw new Error("Could not save the provider receipt. Check database connectivity before retrying.");
 }
 
-// ─── Monthly cap and rate limits (§18.4) ────────────────────────────────────
-
-/**
- * Fails CLOSED: if the counter cannot be read, the caller is refused. A public
- * demo with a sign-in button is a public spend button.
- */
 export async function checkRateLimit(
   scope: "profile" | "ip" | "global",
   scopeKey: string,
@@ -266,6 +211,16 @@ export async function checkRateLimit(
   }
 }
 
+export async function consumeRateLimit(scope: "profile" | "ip" | "global", scopeKey: string,
+  window: "minute" | "hour" | "day" | "month", metric: string, limit: number): Promise<{ allowed: boolean; current: number }> {
+  try {
+    const { data, error } = await serviceClient().rpc("consume_rate_limit", {
+      p_scope: scope, p_scope_key: scopeKey, p_window: window, p_metric: metric, p_limit: limit,
+    });
+    return error || typeof data?.allowed !== "boolean" ? { allowed: false, current: -1 } : data;
+  } catch { return { allowed: false, current: -1 }; }
+}
+
 export async function bumpCounter(
   scope: "profile" | "ip" | "global",
   scopeKey: string,
@@ -283,21 +238,13 @@ export async function bumpCounter(
   if (error) console.error("[cost] bump_counter failed:", error.message);
 }
 
-// ─── Display ────────────────────────────────────────────────────────────────
-
 export function formatCents(cents: number): string {
   if (!Number.isFinite(cents)) return "—";
   const dollars = cents / 100;
-  // Sub-cent amounts are real here — an embedding batch costs a fraction of a
-  // cent — and rounding them to "$0.00" makes the pipeline look free.
   if (dollars > 0 && dollars < 0.01) return "<$0.01";
   return `$${dollars.toFixed(2)}`;
 }
 
-/**
- * A total missing a call reads "at least $X" (§5.3, §17). A total that could
- * not be read at all reads "—", never "0".
- */
 export function formatCost(cents: number | null | undefined, complete = true): string {
   if (cents == null) return "—";
   return complete ? formatCents(cents) : `at least ${formatCents(cents)}`;

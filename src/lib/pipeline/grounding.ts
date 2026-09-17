@@ -1,4 +1,6 @@
 import "server-only";
+import { BudgetExceededError } from "@/lib/cost";
+import { MissingEnvError } from "@/lib/env";
 import { segmentSentences, stripMarkdown, type Sentence } from "@/lib/text";
 import { embed, cosineSimilarity, parseVector } from "@/lib/providers/embeddings";
 import {
@@ -343,6 +345,7 @@ function stripMarkdownKeepingMarkers(markdown: string): string {
 // ─── §8.4 The vector check, and the claim map ───────────────────────────────
 
 export interface BuildClaimMapInput {
+  previous?: ClaimMapEntry[];
   body: string;
   excerpts: LabelledExcerpt[];
   requestId: string;
@@ -375,7 +378,7 @@ export async function buildClaimMap(input: BuildClaimMapInput): Promise<ClaimMap
   const { body, excerpts, requestId, step } = input;
   const byLabel = new Map(excerpts.map((e) => [e.label, e]));
 
-  const sentences = segmentSentencesWithMarkers(stripMarkdownKeepingMarkers(body));
+  const sentences = segmentSentencesWithMarkers(stripMarkdownKeepingMarkers(proseOnly(body)));
   const entries: ClaimMapEntry[] = [];
   const markedIndices: number[] = [];
 
@@ -400,17 +403,28 @@ export async function buildClaimMap(input: BuildClaimMapInput): Promise<ClaimMap
   let degraded = false;
   let degradedReason: string | undefined;
 
-  if (entries.length > 0) {
+  // Reuse only identical claims citing exactly the same stored excerpts.
+  const previous = new Map((input.previous ?? []).map(e => [JSON.stringify([e.sentence, e.labels, e.excerptIds]), e]));
+  const pending = entries.filter(entry => {
+    const saved = previous.get(JSON.stringify([entry.sentence, entry.labels, entry.excerptIds]));
+    if (saved?.groundingScore != null && entry.labels.every(l => byLabel.get(l)?.embedding)) {
+      entry.groundingScore = saved.groundingScore;
+      entry.verdict = verdictFor(saved.groundingScore);
+      return false;
+    }
+    return true;
+  });
+  if (pending.length > 0) {
     try {
       // Embedded as a QUERY, matching how the excerpts were embedded as
       // documents — the input types are not interchangeable.
       const { embeddings } = await embed(
-        entries.map((e) => e.sentence),
+        pending.map((e) => e.sentence),
         "query",
         { requestId, step },
       );
 
-      entries.forEach((entry, i) => {
+      pending.forEach((entry, i) => {
         const sentenceVector = embeddings[i];
         if (!sentenceVector) return;
 
@@ -435,7 +449,8 @@ export async function buildClaimMap(input: BuildClaimMapInput): Promise<ClaimMap
     }
   }
 
-  const factualSentences = countFactualSentences(body);
+  degraded ||= entries.some(e => e.groundingScore === null);
+  const factualSentences = countFactualSentences(proseOnly(body));
   const knownText = excerpts.map((e) => e.text);
 
   return {

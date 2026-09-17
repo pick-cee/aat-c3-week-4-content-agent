@@ -1,128 +1,115 @@
-# Week 4: AI Content Research and Publishing Agent
+# Koya Content Studio
 
-An idea or a URL goes in; a researched, source-grounded article and three
-channel-ready posts come out, with a human approving before anything is
-released.
+An editorial workspace for one agency: research a brief, review the sources and angle, generate a grounded article, prepare LinkedIn/X/newsletter copy, and approve each channel before release.
 
-## Getting started
+The September 2026 refactor replaces browser-dependent step execution with resumable background work, adds provider cost reservations and response checkpoints, and rebuilds the content library, creation flow, navigation and review experience. See [the implementation and validation notes](REFACTOR.md) and [the editor's guide](HOW-IT-WORKS.md).
 
-```bash
-npm install
-cp .env.example .env     # then fill it in — every key is documented in place
+## Local setup
+
+Use Node **22.12+ (22 LTS)** or **24+** and npm **11.19.1**. Node 23 is outside the test runner's supported versions. `.nvmrc` selects 22. npm 10 can fail to resolve the security overrides in this project.
+
+```sh
+npm install --global npm@11.19.1
+npm ci
+```
+
+Copy `.env.example` to `.env` and fill in the required credentials. Existing databases require migrations **0025 through 0030** before running the updated app. Apply them explicitly below, or set `AUTO_MIGRATE=true` for local startup to apply pending files. Applied migrations are skipped; a build does not apply them.
+
+```sh
+npm run db:push
+npm run db:seed
 npm run dev
 ```
 
-The schema creates itself on first boot: migrations run under a Postgres
-advisory lock, so several instances starting at once is safe. Open
-<http://localhost:3000> and the landing page signs you straight in.
+For the demo account on the normal development server (`http://localhost:3000`), set these values in your existing `.env`:
 
-If anything looks wrong, `/api/health` reports the state of Postgres, each
-provider and each connector, so a dead dependency is diagnosable without
-reading logs.
+```dotenv
+DEMO_MODE=true
+ENABLE_DEMO_LOGIN=true
+DISABLE_PUBLISHING=true
+RESEND_API_KEY=
+AUTO_MIGRATE=false
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+```
 
-**On embeddings.** They are not optional garnish: they rank sources, choose what
-goes into the drafting call, and back the weak-citation check that makes a
-citation on an unrelated claim detectable (DESIGN.md §8.4). `OPENAI_API_KEY` is
-therefore required, and it needs billing enabled — the whole corpus for a
-request costs a fraction of a cent, but a free tier's per-minute limit silently
-drops sources from the research instead of failing loudly. Changing embedding
-provider invalidates every stored vector, so the two must never be mixed.
+Sign-in depends on the environment configuration, not the port. Restart the app and worker after changing `.env`. These are local demo settings; configure production separately in its deployment environment.
 
-## Deploying to Vercel
+In a second terminal, run the development worker. It loads `.env` and picks up requests created after it starts:
 
-Set every key from `.env.example` in the project's environment variables, then:
+```sh
+npm run dev:worker
+```
 
-**Scheduled posts need a scheduler, and the free plan is not one.** Vercel's
-Hobby plan allows one cron run a day and rejects a five-minute schedule, so
-`vercel.json` has no `crons` block. `.github/workflows/release.yml` drives
-`/api/cron/release` every minute instead, because a send time is chosen to the
-minute and a five-minute cadence would turn 6:33 into 6:35. Add two repository
-secrets under
-Settings → Secrets and variables → Actions:
+To exercise background drafting without starting the release worker, run `node scripts/dev-worker.cjs --content-only`. This uses the same `.env` and does not change its publishing configuration.
 
-| Secret | Value |
+The worker processes content requests and releases approved, due queue items. Point development at a separate database and use `DEMO_MODE=true`. Demo delivery can still send to an explicitly configured redirect inbox. Leave `RESEND_API_KEY` empty when no email should leave the environment.
+
+For a disposable demo workspace, set `ENABLE_DEMO_LOGIN=true` and `DEMO_MODE=true` before seeding. Keep demo access disabled for client work. `AUTO_MIGRATE=true` is an explicit local convenience only; it is not the production deployment path.
+
+## Production setup
+
+1. Back up the database and pause existing workers during the upgrade. Run `npm run verify:refactor` against a staging copy first. It applies pending migrations and tests them inside one transaction, then rolls everything back. It requires an existing reviewer profile.
+2. Apply `npm run db:push` once during deployment. It uses the existing migration ledger and advisory lock. Do not use `--force` for a normal upgrade. Run `npm run db:seed` to create missing brand voice and connector rows; it does not add recipients.
+3. Provision agency accounts in Supabase Auth, then add matching `content_agent.profiles` rows with the Auth user UUID, email, name, role (`manager`, `reviewer`, or `admin`) and `is_demo=false`. Public signup is not an onboarding path. Provision at least one admin. Use Supabase's admin tools for password resets. Demo credentials cannot read workspace tables directly.
+4. Deploy the Next.js app with `AUTO_MIGRATE=false`, `ENABLE_DEMO_LOGIN=false`, the same database/provider settings, and the correct public `NEXT_PUBLIC_APP_URL`. Set a deliberate monthly spending limit. `DEMO_MODE` defaults to true; set it to false only when actual delivery is intended and configured.
+5. Run **`npm run worker` as a supervised, continuously running Node process** with the same environment. Install development dependencies on the worker because the entry point uses `tsx`. Restart it on failure; allow at least 240 seconds for graceful shutdown. Multiple workers share atomic database claims. The web app can be on Vercel while this process runs on your existing server or worker host.
+6. Verify `/api/health`, a short held request, both human review gates, and queue behavior in staging. Provider checks in health report configuration presence, not live availability. Missing core configuration or schema returns 503. Signed-in members see diagnostic details; anonymous monitors see status only.
+
+The web routes allow 300 seconds. Submission returns promptly and schedules a bounded background drain through Next.js `after()`. The dedicated worker continues after that drain or after the browser closes.
+
+`.github/workflows/release.yml` is a **five-minute recovery sweep**, using repository secrets `APP_URL` and `CRON_SECRET`. GitHub schedules can be delayed and cannot guarantee an exact publish minute. Do not use this sweep as the only driver when predictable generation and delivery latency matter. The browser's authenticated heartbeat is an additional wake-up mechanism. See [GitHub's scheduling constraints](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
+
+## Configuration
+
+| Variables | Purpose |
 | --- | --- |
-| `APP_URL` | `https://your-app.vercel.app`, no trailing slash |
-| `CRON_SECRET` | the same value you set in Vercel |
+| `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY` | Browser authentication; the anon key grants no workspace content access. |
+| `SUPABASE_SERVICE_ROLE_KEY` | Server-only data access. |
+| `SUPABASE_DB_URL` | Direct database connection for migrations and integration checks. |
+| `ANTHROPIC_API_KEY`, `FIRECRAWL_API_KEY`, `OPENAI_API_KEY` | Generation/search, source reading, and embeddings. All three are required for research. |
+| `RESEND_API_KEY`, `RESEND_FROM_EMAIL`, `RESEND_REPLY_TO` | Notifications and newsletter/handoff email. Use a verified sender. |
+| `HANDOFF_POSTER_EMAIL` | Person receiving LinkedIn/X posting packets. |
+| `CRON_SECRET`, `HANDOFF_TOKEN_SECRET` | Independent random secrets for worker access and signed posting confirmations. |
+| `TOKEN_ENCRYPTION_KEY` | 64 hexadecimal characters for connector encryption. |
+| `DEFAULT_REQUEST_BUDGET_CENTS`, `MONTHLY_GLOBAL_CAP_CENTS` | Defaults: 150 cents per request, 5,000 cents per month. |
+| `DEMO_WORKSPACE_BUDGET_CENTS` | Demo request ceiling; defaults to 60 cents. |
+| `OPENVERSE_CLIENT_ID`, `OPENVERSE_CLIENT_SECRET` | Optional image search credentials. Images are selected after drafting; alt text is entered by a person. |
 
-Then run the workflow once by hand (Actions → Release scheduled content → Run
-workflow) to confirm it returns 200 rather than 401. Without those secrets,
-approved content sits in the queue past its send time and nothing says why.
+The remaining rate limits and demo switches are listed in `.env.example`. Never commit `.env` or expose service keys in client components.
 
-While someone has the app open, a heartbeat in the layout also sends what is due
-every thirty seconds, so a schedule feels immediate rather than waiting for the
-next external run. That is a convenience, not the guarantee: nobody has a tab
-open at 03:00.
+For a local demo of the production build, use `npm run build` followed by `npm run preview`, then open `http://127.0.0.1:3100`. This command enables local demo access, starts a worker for new requests and sets `DISABLE_PUBLISHING=true` with outbound email disabled. See [the test handoff](REFACTOR.md#local-test-handoff) for credentials.
 
-On a Pro plan you can restore the `crons` block in `vercel.json` and delete the
-workflow. Running both is harmless: the worker claims each row in one atomic
-statement, so two schedulers racing is a normal outcome rather than a double
-send.
+## Cost and recovery
 
-## The documents
+The form shows a planning estimate, not a guaranteed quote. Before a paid call, the database reserves an allowance against both the request and workspace limits. Provider responses replace that allowance with measured usage. Cache writes, cache reads, discarded output and embedding batches all count. Fractional cents are retained in receipts and rounded at the request total.
 
-- `PRD.md` — the brief
-- `DESIGN.md` — the specification. It wins over convenience; if the code and
-  this document disagree, the document is what gets changed first, on purpose,
-  with a reason
-- `CLAUDE.md` — the standing rules the build is held to
-- `HOW-IT-WORKS.md` — one page on what it does and how to use it
-- `assets/` — the SEO rules, channel formatting rules and evaluation rubric,
-  which are requirements rather than suggestions
+An interrupted call can have unknown usage. Its reservation remains visible and prevents that allowance being spent again. Do not clear it just to make a request run. Reconcile the receipt against the provider's usage records; [REFACTOR.md](REFACTOR.md) explains the operational limits. Provider token/credit reporting and the price table still determine final actual cost; the allowance is not a billing cap enforced by the external provider.
 
-**Three channels, not four.** DESIGN.md §2.12 proposed WhatsApp as a fourth and
-it was dropped. The code and schema are the authority; where those two
-documents still describe a WhatsApp broadcast, the code is right.
+Supply reliable source URLs to skip discovery unless you ask for more sources. Page reads use basic scraping, verified TLS and at most five PDF pages. Firecrawl's own cache still costs a credit. Within one request, a saved successful scrape or generation response is reused on recovery without buying it again.
 
-## Commands
+Transient failures get bounded retries with stored deadlines. Configuration, invalid-output and budget failures stop with the work saved. Unknown **delivery** outcomes are never automatically resent; a reviewer must resolve them.
 
-| Command | What it does |
+## Validation commands
+
+| Command | What it checks |
 | --- | --- |
-| `npm run dev` | Start the app. Migrations and seed run automatically. |
-| `npm run build` | Production build, including a full typecheck. |
-| `npm run typecheck` | Types only. |
-| `npm test` | 188 unit tests. |
-| `npm run broken-pack` | The deliberately broken input pack (DESIGN.md §21.1). |
-| `npm run db:push` | Apply migrations by hand. Shares its ledger and advisory lock with the startup runner, so the two cannot disagree about what is applied. |
-| `npm run db:seed` | Apply migrations and seed the demo account, brand voice, connectors and recipients. Idempotent. |
+| `npm test` | Deterministic regression tests; no paid providers or emails. |
+| `npm run typecheck` | TypeScript types. |
+| `npm run build` | Production routes, server/client boundaries, types and assets. |
+| `npm run verify:refactor` | Database behavior in a rolled-back transaction; no generation or email. |
+| `npm run verify:selects` | Read-only checks of runtime select columns; apply migrations first. |
+| `npm run verify:server` | Read-only HTTP rendering checks against a running local preview; optional authenticated session. |
+| `npm run verify:grants` | Read-only audit of this application's database function grants. |
+| `npm run verify:schemas` | Six small **paid** calls validating the actual structured-output schemas and configured model IDs. Prints observed cost. |
+| `npm run broken-pack` | Legacy scenario harness. Use an isolated test database; it creates records and can exercise delivery. |
 
-### The verification scripts
+CI runs the deterministic suite, production build and dependency audit. Integration tests and paid schema probes are explicit operator commands.
 
-These exist because each one caught a real bug that the type system could not.
-They talk to the live project, so they need `.env` filled in.
+## Scope and documents
 
-| Command | Catches |
-| --- | --- |
-| `npm run verify:grants` | A function executable by `public`, `anon`, or by `authenticated` beyond the two named reads. Postgres grants EXECUTE to PUBLIC by default, so this is one `create function` away from recurring — it is a standing check, not an audit. |
-| `npm run verify:selects` | A `select()` naming a column that no longer exists. These fail at runtime with the whole query erroring, and `data ?? null` turns that into a silent wrong answer — a dropped column once logged every user out. |
-| `npm run verify:schemas` | A structured-output schema the API rejects. It refuses `minItems` above 1, `maxItems`, and numeric bounds — and only says so at call time, three pipeline steps and real money later. |
+This is one shared agency workspace with roles, not a multi-tenant SaaS. Use separate deployments/databases for unrelated clients until tenant isolation is implemented. LinkedIn and X use human posting handoffs; the newsletter sends through Resend to opted-in recipients.
 
-## What it is built to do
-
-Every fact it publishes is traceable to a stored excerpt of a page it actually
-fetched, by an identifier checked mechanically rather than trusted. A citation
-to something that does not exist cannot be saved; one attached to an unrelated
-claim is caught by comparing the sentence to the excerpt by vector distance.
-
-Nothing publishes without a person approving that channel. LinkedIn and X are
-handed to a person to post and stay marked as awaiting posting — never as
-published — until they confirm with a URL.
-
-And it is honest about what it does not know. A source that failed to fetch is
-distinct from one that was empty. A send whose outcome nobody can account for
-is `uncertain`, never retried automatically, and counted separately from a
-failure. A count that could not be read shows a dash, not a zero.
-
-The same distinction applies to indexing. A source the embedding service merely
-rate-limited is retried automatically and says so; one that genuinely cannot be
-indexed is marked and left for manual inclusion. Collapsing those two into a
-single "failed" flag once discarded six good articles and surfaced, three steps
-later, as a complaint that the angles looked too similar — so the difference is
-recorded in the table, not inferred.
-
-It also never claims to be retrying when it is not. The word "retrying" appears
-only when another attempt is genuinely scheduled, with the attempt number shown;
-a failure that cannot succeed on a second try — a budget that has run out, for
-instance — stops immediately and says what it needs and who can supply it. A
-spinner that never resolves is worse than an error, because an error can be
-acted on.
+- [DESIGN.md](DESIGN.md): specification, with the September refactor amendments taking precedence.
+- [CLAUDE.md](CLAUDE.md): repository rules and historical implementation context.
+- [PRD.md](PRD.md): original product brief.
+- [assets](assets/): SEO requirements, evaluation rubric and channel formatting rules.

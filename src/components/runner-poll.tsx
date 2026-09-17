@@ -1,227 +1,66 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import { currentStepLabel } from "./stepper";
 import type { RequestStatus } from "@/lib/db/types";
 
-/**
- * Drives the step runner while a person is watching. DESIGN.md §3.1.
- *
- * "POST /api/runner advances one request by exactly one step and returns. It
- * is driven by the client polling while a user is watching, and by the release
- * cron as a safety net when nobody is."
- *
- * Each call advances at most one step, so the loop continues until the runner
- * says there is no more work or the request reaches a state that waits for a
- * human.
- */
+type Progress = { status: RequestStatus; current_step: string | null; step_attempts: number; step_started_at: string | null; retry_after: string | null; runner_lease_until: string | null; actual_cost_cents: number };
+const RUNNING = new Set(["researching", "drafting", "evaluating", "revising", "adapting"]);
 
-/**
- * Anything that looks like a provider error rather than a progress update.
- *
- * A status code, a JSON body or a stack trace is a diagnostic. It is kept in
- * the activity log, which is where someone debugging goes; it has no business
- * in the banner someone reads to know whether their article is being written.
- */
-/**
- * How many failed polls in a row before giving up.
- *
- * Three at a three-second cadence is about ten seconds of trying, which covers
- * a restart or a slow provider without spinning forever on something genuinely
- * broken.
- */
-const MAX_CONSECUTIVE_FAILURES = 3;
-
-function presentable(message: string): string | null {
-  if (!message) return null;
-
-  const looksLikeAnError =
-    /^\d{3}\s/.test(message) ||
-    message.includes('{"type"') ||
-    message.includes("invalid_request_error") ||
-    message.includes("request_id") ||
-    /\bError:/.test(message) ||
-    message.length > 160;
-
-  return looksLikeAnError ? null : message;
-}
-
-/** A plain description of where the pipeline is, when there is nothing better. */
-function describeStatus(status: RequestStatus): string {
-  switch (status) {
-    case "researching": return "Finding and reading sources";
-    case "drafting": return "Writing the article";
-    case "evaluating": return "Checking the draft against the rubric";
-    case "revising": return "Rewriting the sections that need work";
-    case "adapting": return "Preparing each channel";
-    default: return "Working";
-  }
-}
-
-export function RunnerPoll({
-  requestId,
-  status,
-}: {
-  requestId: string;
-  status: RequestStatus;
-}) {
+/** Poll inexpensive progress reads. Work lives on the server, independently of this tab. */
+export function RunnerPoll({ requestId, status, step, startedAt }: { requestId: string; status: RequestStatus; step?: string | null; startedAt?: string | null }) {
   const router = useRouter();
-  const [message, setMessage] = useState<string>(() => describeStatus(status));
+  const [progress, setProgress] = useState<Progress>({ status, current_step: step ?? null, step_attempts: 0, step_started_at: startedAt ?? null, retry_after: null, runner_lease_until: null, actual_cost_cents: 0 });
   const [error, setError] = useState<string | null>(null);
-  const [attempt, setAttempt] = useState<{ current: number; of: number } | null>(null);
-  const running = useRef(false);
-  // Consecutive failures, reset by any success.
-  const failures = useRef(0);
-  const stopped = useRef(false);
+  const [now, setNow] = useState(0);
+  const [reconnect, setReconnect] = useState(0);
 
   useEffect(() => {
-    stopped.current = false;
-
-    async function step() {
-      // One in flight at a time: overlapping calls would both find the lease
-      // taken and waste a round trip.
-      if (running.current || stopped.current) return;
-      running.current = true;
-
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout>;
+    let lastSignature = "";
+    let lastWake = 0;
+    let failures = 0;
+    const controller = new AbortController();
+    const clock = setInterval(() => setNow(Date.now()), 1000);
+    async function poll() {
+      if (stopped) return;
+      if (document.visibilityState !== "visible") { timer = setTimeout(poll, 3000); return; }
       try {
-        const response = await fetch("/api/runner", {
-          method: "POST",
-          headers: { "content-type": "application/json" },
-          body: JSON.stringify({ requestId }),
-        });
-
-        if (!response.ok) {
-          const body = (await response.json().catch(() => ({}))) as { error?: string };
-
-          /**
-           * One bad response used to stop the poller for good, leaving the
-           * request sitting mid-pipeline behind "the pipeline stopped
-           * advancing, reloading resumes from where it got to" — which asked
-           * a person to do by hand what the poller was there to do.
-           *
-           * A step is resumable by design (§3.1), so a failure is worth
-           * retrying before giving up. A 401 is not: that one will never
-           * resolve by trying again.
-           */
-          const permanent = response.status === 401 || response.status === 403;
-          failures.current += 1;
-
-          if (!permanent && failures.current < MAX_CONSECUTIVE_FAILURES) {
-            setError(null);
-            router.refresh();
-            return;
-          }
-
-          setError(
-            presentable(body.error ?? "") ??
-              "The pipeline stopped advancing after several attempts. Nothing was lost: " +
-                "every step stores its output before the next begins.",
-          );
-          stopped.current = true;
-          router.refresh();
-          return;
+        const response = await fetch(`/api/runner?requestId=${requestId}`, { cache: "no-store", signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) });
+        if (stopped) return;
+        if (response.status === 401 || response.status === 403) { setError("Your session has ended. Sign in again to see progress."); router.refresh(); return; }
+        if (response.status === 404) { router.refresh(); return; }
+        if (!response.ok) throw new Error("Progress unavailable");
+        const next: Progress = await response.json();
+        if (stopped) return;
+        failures = 0;
+        setError(null);
+        setProgress(next);
+        const signature = `${next.status}:${next.current_step}:${next.actual_cost_cents}:${next.step_attempts}`;
+        if (lastSignature !== signature) { lastSignature = signature; router.refresh(); }
+        if (!RUNNING.has(next.status)) return;
+        const time = Date.now();
+        const leased = next.runner_lease_until && Date.parse(next.runner_lease_until) > time;
+        const waiting = next.retry_after && Date.parse(next.retry_after) > time;
+        if (!leased && !waiting && time - lastWake > 15_000) {
+          lastWake = time;
+          const wake = await fetch("/api/runner", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requestId }), signal: AbortSignal.any([controller.signal, AbortSignal.timeout(10_000)]) });
+          if (!wake.ok) throw new Error("Could not resume work");
         }
-
-        // A good response clears the run of failures.
-        failures.current = 0;
-
-        const result = (await response.json()) as {
-          advanced: boolean;
-          message: string;
-          more: boolean;
-          to: RequestStatus;
-          attempt?: { current: number; of: number } | null;
-        };
-
-        // A retry that is actually happening says so, with a count. A spinner
-        // that looks identical to normal progress is how "it retried three
-        // times and gave up" becomes "it froze".
-        setAttempt(result.attempt ?? null);
-
-        // Never print a raw provider error into the banner. A 400 with a JSON
-        // body is a diagnostic, and it belongs in the activity log where an
-        // engineer looks — not in the one line a content manager reads to know
-        // whether their article is being written.
-        setMessage(presentable(result.message) ?? describeStatus(result.to));
-
-        // Refresh whenever the state changed, so the page reflects reality
-        // rather than the state it was rendered with.
-        if (result.advanced) router.refresh();
-
-        if (!result.more) {
-          stopped.current = true;
-          return;
-        }
-      } catch (err) {
-        // A dropped connection is the most transient failure there is, and it
-        // used to stop the poller for good. A laptop waking from sleep should
-        // not end a pipeline run.
-        failures.current += 1;
-        if (failures.current < MAX_CONSECUTIVE_FAILURES) {
-          setError(null);
-        } else {
-          setError(
-            err instanceof Error
-              ? `Could not reach the runner: ${err.message}`
-              : "Could not reach the runner.",
-          );
-          stopped.current = true;
-        }
-      } finally {
-        running.current = false;
+      } catch {
+        if (stopped) return;
+        failures++;
+        if (failures >= 2) setError("Connection interrupted. Your saved work is safe. Reconnecting…");
       }
+      if (!stopped) timer = setTimeout(poll, Math.min(15_000, 2000 * Math.max(1, failures)));
     }
+    void poll();
+    return () => { stopped = true; clearTimeout(timer); clearInterval(clock); controller.abort(); };
+  }, [requestId, router, reconnect]);
 
-    void step();
-    const timer = setInterval(step, 3_000);
-
-    return () => {
-      stopped.current = true;
-      clearInterval(timer);
-    };
-  }, [requestId, router]);
-
-  if (error) {
-    return (
-      <div className="alert alert-error">
-        {error}
-        <div className="tiny mt-1">
-          Each step stores its output before the next begins, so nothing produced so far is lost.
-          The full detail is in the activity log below.
-        </div>
-      </div>
-    );
-  }
-
-  // A retry in progress is its own state, not a variation on "working". The
-  // person watching needs to know that something went wrong, that it is being
-  // tried again, and how many attempts are left before it stops — otherwise a
-  // spinner that never resolves is the only feedback they get.
-  if (attempt) {
-    return (
-      <div className="alert alert-warn">
-        <span className="row">
-          <span className="spin" />
-          <strong>
-            {message}, trying again, attempt {attempt.current} of {attempt.of}
-          </strong>
-        </span>
-        <div className="tiny mt-1">
-          Everything produced so far is saved. If the last attempt fails, this stops and
-          tells you why rather than retrying forever.
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="alert alert-info">
-      <span className="row">
-        <span className="spin" />
-        {/* No raw status suffix. "· evaluating" is the database's word for it,
-            not something a content manager asked to see. */}
-        <strong>{message}…</strong>
-      </span>
-    </div>
-  );
+  const seconds = progress.step_started_at && now ? Math.max(0, Math.floor((now - Date.parse(progress.step_started_at)) / 1000)) : 0;
+  const waiting = progress.retry_after && Date.parse(progress.retry_after) > now;
+  return <div className="progress-banner" role="status"><span className="spin" /><div><h2>{error ? "Reconnecting to your workspace" : currentStepLabel(progress.status, progress.current_step)}</h2><p>{error ?? (waiting ? "A provider is temporarily unavailable. A retry is scheduled; no action needed." : "Progress is saved as we go. Your draft will appear here as soon as it is written.")}</p>{error && <button className="btn btn-sm mt-1" onClick={()=>setReconnect(v=>v+1)}>Reconnect now</button>}</div><span className="progress-elapsed">{seconds >= 60 ? `${Math.floor(seconds / 60)}m ${seconds % 60}s` : `${seconds}s`}{progress.step_attempts > 1 ? ` · attempt ${progress.step_attempts}/3` : ""}</span></div>;
 }

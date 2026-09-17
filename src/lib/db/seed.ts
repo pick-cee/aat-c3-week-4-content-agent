@@ -61,7 +61,7 @@ export async function seedIfEmpty(): Promise<void> {
   try {
     const db = serviceClient();
 
-    await seedDemoAccounts(db);
+    if (env.app.demoLoginEnabled) await seedDemoAccounts(db);
     await seedBrandVoice(db);
     await seedConnectors(db);
     /**

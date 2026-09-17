@@ -1,12 +1,12 @@
 import "server-only";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { priceScrapes, reserveModelCall, recordModelCall } from "@/lib/cost";
 import { env } from "@/lib/env";
+import { serviceClient, table } from "@/lib/db/client";
 import {
   FIRECRAWL_MAX_AGE_MS,
   MIN_MARKDOWN_CHARS,
   MAX_MARKDOWN_CHARS,
-  FETCH_RETRY_ATTEMPTS,
-  FETCH_RETRY_BASE_MS,
   PAYWALL_MARKERS,
   NOT_AN_ARTICLE_MARKERS,
   NOT_AN_ARTICLE_MAX_CHARS,
@@ -39,9 +39,10 @@ export interface ScrapeResult {
   error: string | null;
   contentHash: string | null;
   markdownChars: number;
-  /** True when Firecrawl served this from cache — a paid no-op avoided. */
+  /** Provider cache hits still consume a scrape credit. */
   fromCache: boolean;
   creditsUsed: number;
+  creditsKnown?: boolean;
   /** Set when the final URL left the registrable domain we asked for. */
   finalUrl: string | null;
   /** Whether retrying this could plausibly help (§17). */
@@ -81,7 +82,34 @@ interface FirecrawlResponse {
  * Firecrawl API itself is unusable, because that is a system failure rather
  * than a fact about the page.
  */
-export async function scrape(url: string): Promise<ScrapeResult> {
+export class ScrapeProviderError extends Error {
+  constructor(message: string, public readonly retryable: boolean, public readonly usageKnown = false) { super(message); this.name = "ScrapeProviderError"; }
+}
+
+export async function scrape(url: string, requestId?: string): Promise<ScrapeResult> {
+  void env.firecrawl.apiKey;
+  const inputHash = createHash("sha256").update(JSON.stringify({ url, contract: "basic-pdf5-v1" })).digest("hex");
+  if (requestId) {
+    const { data, error } = await serviceClient().from(table("model_calls")).select("response_json")
+      .eq("request_id", requestId).eq("input_hash", inputHash).eq("model", "firecrawl")
+      .eq("outcome", "used").not("response_json", "is", null)
+      .order("created_at", { ascending: false }).limit(1).maybeSingle();
+    if (error) throw new Error("Could not read the saved source response: " + error.message);
+    if (data?.response_json) return data.response_json as unknown as ScrapeResult;
+  }
+  const id = randomUUID(), ceiling = priceScrapes(6), started = Date.now();
+  if (requestId) await reserveModelCall(id, requestId, "fetch", "firecrawl", ceiling);
+  let result: ScrapeResult;
+  try { result = await fetchPage(url); }
+  catch (error) {
+    if (requestId) await recordModelCall({ id, requestId, step: "fetch", model: "firecrawl", usage: { inputTokens: 0, outputTokens: 0 }, outcome: "failed", usageKnown: error instanceof ScrapeProviderError && error.usageKnown, costCentsOverride: 0, costCeilingCents: error instanceof ScrapeProviderError && error.usageKnown ? 0 : ceiling, error: error instanceof Error ? error.message : String(error), latencyMs: Date.now() - started });
+    throw error;
+  }
+  if (requestId) await recordModelCall({ id, requestId, step: "fetch", model: "firecrawl", purpose: "Read source page", usage: { inputTokens: 0, outputTokens: 0 }, outcome: "used", costCentsOverride: priceScrapes(result.creditsUsed), usageKnown: result.creditsKnown !== false, costCeilingCents: result.creditsKnown === false ? ceiling : 0, latencyMs: Date.now() - started, inputHash, response: result.retryable ? undefined : result });
+  return result;
+}
+
+async function fetchPage(url: string): Promise<ScrapeResult> {
   const base: Omit<ScrapeResult, "status" | "error" | "retryable"> = {
     markdown: null,
     title: null,
@@ -96,83 +124,24 @@ export async function scrape(url: string): Promise<ScrapeResult> {
     finalUrl: null,
   };
 
-  let response: Response | null = null;
-  let body: FirecrawlResponse | null = null;
-  let lastError: string | null = null;
-
-  for (let attempt = 0; attempt <= FETCH_RETRY_ATTEMPTS; attempt++) {
-    try {
-      response = await fetch(SCRAPE_URL, {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${env.firecrawl.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          url,
-          formats: ["markdown"],
-          onlyMainContent: true,
-          // Re-scraping a page we read last week is a paid no-op (§7.3, §18.4).
-          maxAge: FIRECRAWL_MAX_AGE_MS,
-          timeout: 45_000,
-          blockAds: true,
-        }),
-        signal: AbortSignal.timeout(60_000),
-      });
-
-      // Retries are two attempts with exponential backoff and jitter, on 429
-      // and 5xx ONLY. A 404 is not retried, because retrying a 404 is spending
-      // money to be told the same thing (§7.3).
-      if (response.status === 429 || response.status >= 500) {
-        lastError = `Firecrawl returned ${response.status}`;
-        if (attempt < FETCH_RETRY_ATTEMPTS) {
-          await sleep(FETCH_RETRY_BASE_MS * 2 ** attempt + Math.random() * 400);
-          continue;
-        }
-        return {
-          ...base,
-          httpStatus: response.status,
-          status: "fetch_failed",
-          error:
-            response.status === 429
-              ? "Rate limited by the scraping service after two retries."
-              : `The scraping service returned ${response.status} after two retries.`,
-          retryable: true,
-        };
-      }
-
-      body = (await response.json()) as FirecrawlResponse;
-      break;
-    } catch (err) {
-      lastError = err instanceof Error ? err.message : String(err);
-      const isTimeout = err instanceof Error && err.name === "TimeoutError";
-      if (attempt < FETCH_RETRY_ATTEMPTS) {
-        await sleep(FETCH_RETRY_BASE_MS * 2 ** attempt + Math.random() * 400);
-        continue;
-      }
-      return {
-        ...base,
-        status: "fetch_failed",
-        error: isTimeout
-          ? "The page took too long to fetch and timed out after two retries."
-          : `Could not reach the scraping service: ${lastError}`,
-        retryable: true,
-      };
-    }
+  let response: Response;
+  try {
+    response = await fetch(SCRAPE_URL, {
+      method: "POST", headers: { Authorization: "Bearer " + env.firecrawl.apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ url, formats: ["markdown"], onlyMainContent: true, maxAge: FIRECRAWL_MAX_AGE_MS,
+        timeout: 25_000, blockAds: true, proxy: "basic", skipTlsVerification: false,
+        parsers: [{ type: "pdf", maxPages: 5 }] }),
+      signal: AbortSignal.timeout(35_000),
+    });
+  } catch (error) {
+    throw new ScrapeProviderError(error instanceof Error ? error.message : "The scraping service could not be reached.", true);
   }
-
-  if (!body) {
-    return {
-      ...base,
-      status: "fetch_failed",
-      error: lastError ?? "The scraping service returned no response.",
-      retryable: true,
-    };
-  }
-
+  if (!response.ok) throw new ScrapeProviderError("The scraping service returned HTTP " + response.status, response.status === 408 || response.status === 429 || response.status >= 500, response.status >= 400 && response.status < 500 && response.status !== 408);
+  const body = await response.json() as FirecrawlResponse;
   const metadata = body.data?.metadata ?? {};
   const httpStatus = metadata.statusCode ?? response?.status ?? null;
   const finalUrl = metadata.sourceURL ?? metadata.url ?? null;
+  const isPdf = metadata.contentType?.toLowerCase().includes("pdf") || /\.pdf(?:[?#]|$)/i.test(finalUrl ?? url) || /\.pdf(?:[?#]|$)/i.test(url);
 
   const enriched = {
     ...base,
@@ -182,7 +151,8 @@ export async function scrape(url: string): Promise<ScrapeResult> {
     author: metadata.author ?? null,
     publishedAt: normaliseDate(metadata.publishedTime ?? metadata.articlePublishedTime),
     fromCache: metadata.cached === true,
-    creditsUsed: metadata.creditsUsed ?? (metadata.cached ? 0 : 1),
+    creditsUsed: metadata.creditsUsed ?? (isPdf ? 0 : 1),
+    creditsKnown: metadata.creditsUsed != null || !isPdf,
     finalUrl,
   };
 
@@ -315,10 +285,6 @@ function normaliseDate(value: string | undefined): string | null {
   if (!value) return null;
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

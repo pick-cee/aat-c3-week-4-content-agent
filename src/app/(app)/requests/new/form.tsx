@@ -3,350 +3,68 @@
 import { useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { createRequest } from "@/app/actions/requests";
-import { ALL_CHANNELS, MAX_SEED_URLS, MIN_IDEA_CHARS } from "@/lib/constants";
+import { ALL_CHANNELS, MAX_SEED_URLS, MIN_IDEA_CHARS, MAX_IDEA_CHARS } from "@/lib/constants";
+import { estimateRequestCost, requestInputSchema } from "@/lib/intake";
 import { CHANNEL_LABELS } from "@/components/status";
+import { Icon } from "@/components/icon";
 import type { ChannelName } from "@/lib/db/types";
 
-/**
- * The intake form. DESIGN.md §6.
- *
- * Validation happens here AND in the server action. This copy exists to give
- * immediate feedback; the server's copy is the one that decides, because the
- * UI is not a security boundary.
- */
+interface VoiceOption { id: string; name: string; audienceDefault: string | null; isDefault: boolean }
 
-interface VoiceOption {
-  id: string;
-  name: string;
-  audienceDefault: string | null;
-  isDefault: boolean;
-}
-
-export function NewRequestForm({
-  voices,
-  defaultBudgetCents,
-  submitToken,
-  isDemo,
-  budgetCapCents,
-}: {
-  voices: VoiceOption[];
-  defaultBudgetCents: number;
-  submitToken: string;
-  isDemo: boolean;
-  /** Hard ceiling for this workspace, or null when there is none. */
-  budgetCapCents: number | null;
+export function NewRequestForm({ voices, defaultBudgetCents, submitToken, budgetCapCents }: {
+  voices: VoiceOption[]; defaultBudgetCents: number; submitToken: string; isDemo: boolean; budgetCapCents: number | null;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
-
-  const defaultVoice = voices.find((v) => v.isDefault) ?? voices[0];
-
+  const defaultVoice = voices.find(v => v.isDefault) ?? voices[0];
   const [idea, setIdea] = useState("");
   const [audience, setAudience] = useState(defaultVoice?.audienceDefault ?? "");
   const [keyword, setKeyword] = useState("");
   const [urlText, setUrlText] = useState("");
   const [channels, setChannels] = useState<ChannelName[]>([...ALL_CHANNELS]);
   const [voiceId, setVoiceId] = useState(defaultVoice?.id ?? "");
-  // Held as dollars, submitted as cents.
   const [budget, setBudget] = useState((defaultBudgetCents / 100).toFixed(2));
   const [schedule, setSchedule] = useState<"now" | "later" | "hold">("hold");
   const [publishAt, setPublishAt] = useState("");
   const [error, setError] = useState<string | null>(null);
-
-  const seedUrls = urlText
-    .split(/[\n,]/)
-    .map((u) => u.trim())
-    .filter(Boolean);
-
-  // The estimate shown BEFORE research starts (§6). Mirrors
-  // estimateRequestCost on the server.
-  const estimateCents = estimate(seedUrls.length, channels.length);
+  const seedUrls = [...new Set(urlText.split(/\n/).map(u => u.trim()).filter(Boolean))];
+  const estimateCents = estimateRequestCost(seedUrls.length, channels.length);
   const budgetCents = Math.round((Number.parseFloat(budget) || 0) * 100);
   const overBudget = estimateCents > budgetCents;
-  // Refused server-side too; this only saves the round trip.
   const overCap = budgetCapCents != null && budgetCents > budgetCapCents;
+  const scheduledDate = publishAt ? new Date(publishAt) : null;
+  const scheduleValid = schedule !== "later" || (scheduledDate && Number.isFinite(scheduledDate.getTime()) && scheduledDate.getTime() > Date.now());
+  const canSubmit = idea.trim().length >= MIN_IDEA_CHARS && audience.trim().length >= 3 && channels.length > 0 && seedUrls.length <= MAX_SEED_URLS && !overBudget && !overCap && scheduleValid && !pending;
 
-  const ideaTooShort = idea.trim().length > 0 && idea.trim().length < MIN_IDEA_CHARS;
-  const tooManyUrls = seedUrls.length > MAX_SEED_URLS;
-  const canSubmit =
-    idea.trim().length >= MIN_IDEA_CHARS &&
-    audience.trim().length > 0 &&
-    channels.length > 0 &&
-    !tooManyUrls &&
-    !overBudget &&
-    !overCap &&
-    !pending;
-
-  function submit() {
+  function submit(event: React.FormEvent) {
+    event.preventDefault();
     setError(null);
-
+    if (!canSubmit) { setError("Add your brief, audience, and at least one channel. Check the budget and schedule before continuing."); return; }
+    const input = { idea, targetAudience: audience, primaryKeyword: keyword || undefined, seedUrls, channels, brandVoiceId: voiceId || undefined, budgetCents, publishTarget: schedule === "later" ? scheduledDate!.toISOString() : null, holdInQueue: schedule === "hold", submitToken };
+    const parsed = requestInputSchema.safeParse(input);
+    if (!parsed.success) { setError(parsed.error.issues[0]?.message ?? "Please check your brief."); return; }
     startTransition(async () => {
-      const result = await createRequest({
-        idea,
-        targetAudience: audience,
-        primaryKeyword: keyword || undefined,
-        seedUrls,
-        channels,
-        brandVoiceId: voiceId || undefined,
-        budgetCents,
-        publishTarget: schedule === "later" && publishAt ? new Date(publishAt).toISOString() : null,
-        holdInQueue: schedule === "hold",
-        submitToken,
-      });
-
-      if (!result.ok) {
-        setError(result.error ?? "Something went wrong.");
-        return;
-      }
-      router.push(`/requests/${result.data!.id}`);
+      try {
+        const result = await createRequest(parsed.data);
+        if (!result.ok || !result.data) { setError(result.error ?? "The request could not be created. Please try again."); return; }
+        router.push(`/requests/${result.data.id}`);
+      } catch { setError("We couldn’t confirm your request. Try again; submitting the same brief here won’t create a duplicate."); }
     });
   }
 
-  function toggleChannel(channel: ChannelName) {
-    setChannels((current) =>
-      current.includes(channel) ? current.filter((c) => c !== channel) : [...current, channel],
-    );
-  }
-
-  return (
-    <div className="split">
-      <div className="card card-pad">
-        {error && <div className="alert alert-error">{error}</div>}
-
-        <div className="field">
-          <label htmlFor="idea">The idea</label>
-          <textarea
-            id="idea"
-            value={idea}
-            onChange={(e) => setIdea(e.target.value)}
-            rows={4}
-            placeholder="What should this article be about? A sentence or two is enough."
-          />
-          <div className="hint">
-            {ideaTooShort
-              ? `${MIN_IDEA_CHARS - idea.trim().length} more characters needed, there has to be something to research.`
-              : "Plain language. The system turns this into search queries and three angles."}
-          </div>
-        </div>
-
-        <div className="field">
-          <label htmlFor="audience">Target audience</label>
-          <input
-            id="audience"
-            type="text"
-            value={audience}
-            onChange={(e) => setAudience(e.target.value)}
-            placeholder="Founders and hiring leads at growing African companies"
-          />
-          <div className="hint">
-            Judged against at evaluation, so be specific about who this is for.
-          </div>
-        </div>
-
-        <div className="field">
-          <label htmlFor="keyword">Primary keyword <span className="dim">(optional)</span></label>
-          <input
-            id="keyword"
-            type="text"
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-            placeholder="remote hiring"
-          />
-          <div className="hint">
-            Leave blank and each angle proposes one for you to confirm.
-          </div>
-        </div>
-
-        <div className="field">
-          <label htmlFor="urls">Source URLs <span className="dim">(optional)</span></label>
-          <textarea
-            id="urls"
-            value={urlText}
-            onChange={(e) => setUrlText(e.target.value)}
-            rows={3}
-            placeholder={"https://example.com/article\nhttps://example.com/report"}
-          />
-          <div className="hint">
-            {tooManyUrls ? (
-              <span style={{ color: "var(--danger)" }}>
-                {seedUrls.length} URLs, the limit is {MAX_SEED_URLS}, because cost scales with this.
-              </span>
-            ) : seedUrls.length > 0 ? (
-              // §7.2: no search call when the manager supplied URLs. This is
-              // the answer to "when should this automation not run".
-              `${seedUrls.length} URL${seedUrls.length === 1 ? "" : "s"}. No web search will run unless the idea asks for more, which saves the search cost.`
-            ) : (
-              "None means the raw-idea path: the system searches for material itself."
-            )}
-          </div>
-        </div>
-
-        <div className="field">
-          <label>Channels</label>
-          <div className="stack" style={{ gap: 8 }}>
-            {ALL_CHANNELS.map((channel) => (
-              <label key={channel} className="check">
-                <input
-                  type="checkbox"
-                  checked={channels.includes(channel)}
-                  onChange={() => toggleChannel(channel)}
-                />
-                <span>
-                  {CHANNEL_LABELS[channel]}
-                  {(channel === "linkedin" || channel === "x") && (
-                    <span className="dim tiny">
-                      {" "}
-                      — generated and scheduled, then handed to a person to post
-                    </span>
-                  )}
-                </span>
-              </label>
-            ))}
-          </div>
-        </div>
-
-        <div className="field-row">
-          <div className="field">
-            <label htmlFor="voice">Brand voice</label>
-            <select id="voice" value={voiceId} onChange={(e) => setVoiceId(e.target.value)}>
-              {voices.map((voice) => (
-                <option key={voice.id} value={voice.id}>
-                  {voice.name}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          <div className="field">
-            {/* Dollars. The field took CENTS while the estimate beside it was
-                shown in dollars, so "60" next to "$0.41" read as sixty dollars
-                and bought sixty cents, which is how a request runs out of
-                money at the evaluation step. */}
-            <label htmlFor="budget">Budget ($)</label>
-            <input
-              id="budget"
-              type="number"
-              value={budget}
-              min={0.1}
-              step={0.05}
-              onChange={(e) => setBudget(e.target.value)}
-            />
-            <div className="hint">
-              {/* The cap is named. It used to be applied silently, so a
-                  request created at $1.20 ran on $0.60 and then stopped
-                  saying the budget was reached. */}
-              {budgetCapCents != null
-                ? `The demo workspace caps this at $${(budgetCapCents / 100).toFixed(2)}.`
-                : "Crossing it stops the request, intact."}
-            </div>
-          </div>
-        </div>
-
-        <div className="field">
-          <label>When approved content should go out</label>
-          <div className="stack" style={{ gap: 8 }}>
-            <label className="check">
-              <input
-                type="radio"
-                name="schedule"
-                checked={schedule === "hold"}
-                onChange={() => setSchedule("hold")}
-              />
-              <span>Hold in the queue, decide at approval</span>
-            </label>
-            <label className="check">
-              <input
-                type="radio"
-                name="schedule"
-                checked={schedule === "now"}
-                onChange={() => setSchedule("now")}
-              />
-              <span>As soon as it is approved</span>
-            </label>
-            <label className="check">
-              <input
-                type="radio"
-                name="schedule"
-                checked={schedule === "later"}
-                onChange={() => setSchedule("later")}
-              />
-              <span>At a specific time</span>
-            </label>
-            {schedule === "later" && (
-              <input
-                type="datetime-local"
-                value={publishAt}
-                onChange={(e) => setPublishAt(e.target.value)}
-              />
-            )}
-          </div>
-        </div>
-
-        <button className="btn btn-primary" onClick={submit} disabled={!canSubmit}>
-          {pending ? (
-            <>
-              <span className="spin" /> Starting research…
-            </>
-          ) : (
-            "Start research"
-          )}
-        </button>
-      </div>
-
-      <aside className="stack">
-        <div className="card card-pad">
-          <h3 className="mb-1" style={{ fontSize: 14 }}>
-            Estimated cost
-          </h3>
-          <div style={{ fontSize: 26, fontWeight: 650, letterSpacing: "-0.02em" }}>
-            ${(estimateCents / 100).toFixed(2)}
-          </div>
-          <p className="small muted mt-1 mb-0">
-            Research, planning, one draft, evaluation, a revision round and{" "}
-            {channels.length} channel version{channels.length === 1 ? "" : "s"}.
-          </p>
-
-          {overCap && (
-            <div className="alert alert-error mt-2 mb-0 small">
-              The demo workspace caps a request at ${(budgetCapCents! / 100).toFixed(2)}. Lower
-              the budget to continue.
-            </div>
-          )}
-
-          {overBudget && (
-            <div className="alert alert-error mt-2 mb-0 small">
-              This is more than the ${(budgetCents / 100).toFixed(2)} budget, so the request will
-              not start. Raise the budget or use fewer sources.
-            </div>
-          )}
-        </div>
-
-        <div className="card card-pad">
-          <h3 className="mb-1" style={{ fontSize: 14 }}>
-            What happens next
-          </h3>
-          <ol className="small muted" style={{ paddingLeft: 18, margin: 0, lineHeight: 1.8 }}>
-            <li>Sources are found and read</li>
-            <li>
-              <strong>You confirm the sources and pick an angle</strong>
-            </li>
-            <li>The article is written from stored excerpts</li>
-            <li>It is graded, and weak sections are rewritten</li>
-            <li>Each channel version is produced and format-checked</li>
-            <li>
-              <strong>You approve each channel</strong>
-            </li>
-            <li>Approved content is released on schedule</li>
-          </ol>
-        </div>
-      </aside>
+  return <form className="create-layout" onSubmit={submit}>
+    <div className="brief-sections">
+      {error && <div className="alert alert-error" role="alert">{error}</div>}
+      <section className="brief-section"><div className="form-section-title"><span>01</span><div><h2>Start with the idea</h2><p>What should your audience take away from this piece?</p></div></div>
+        <div className="field"><label htmlFor="idea">Content brief <span className="required">*</span></label><textarea id="idea" required minLength={MIN_IDEA_CHARS} maxLength={MAX_IDEA_CHARS} value={idea} onChange={e => setIdea(e.target.value)} rows={5} placeholder="e.g. A practical guide to building a remote hiring process for growing teams. Focus on evaluating candidates fairly, with useful examples." /><div className="field-foot"><span>Give us a topic, perspective, and anything worth covering.</span><span>{idea.length}/{MAX_IDEA_CHARS}</span></div></div>
+        <div className="field"><label htmlFor="audience">Who is it for? <span className="required">*</span></label><input id="audience" required minLength={3} maxLength={500} value={audience} onChange={e => setAudience(e.target.value)} placeholder="e.g. Founders and people leads at growing companies" /></div>
+        <div className="field-row"><div className="field"><label htmlFor="voice">Brand voice</label><select id="voice" value={voiceId} onChange={e => { const voice = voices.find(v=>v.id===e.target.value); setVoiceId(e.target.value); if (!audience.trim()) setAudience(voice?.audienceDefault ?? ""); }}>{!voices.length && <option value="">Default editorial voice</option>}{voices.map(v=><option key={v.id} value={v.id}>{v.name}</option>)}</select></div><div className="field"><label htmlFor="keyword">SEO keyword <span className="dim">optional</span></label><input id="keyword" maxLength={100} value={keyword} onChange={e=>setKeyword(e.target.value)} placeholder="We can suggest one" /></div></div>
+      </section>
+      <section className="brief-section"><div className="form-section-title"><span>02</span><div><h2>Give it a starting point</h2><p>Add trusted sources to focus research and reduce search costs.</p></div></div><div className="field mb-0"><label htmlFor="urls">Source links <span className="dim">optional</span></label><textarea id="urls" value={urlText} onChange={e=>setUrlText(e.target.value)} rows={3} placeholder="Paste one article, report, or website URL per line" /><div className="hint">{seedUrls.length ? `${seedUrls.length} of ${MAX_SEED_URLS} sources. Web search is skipped unless you explicitly ask for more sources.` : "No links? We’ll search for relevant sources and let you review them."}</div></div></section>
+      <section className="brief-section"><div className="form-section-title"><span>03</span><div><h2>Choose where it goes</h2><p>Your article is included. Add the channels you need.</p></div></div><fieldset className="channel-choices"><legend className="sr-only">Channels</legend>{ALL_CHANNELS.map(channel=><label className={`channel-choice ${channels.includes(channel) ? "is-selected" : ""}`} key={channel}><input type="checkbox" checked={channels.includes(channel)} onChange={()=>setChannels(current=>current.includes(channel) ? current.filter(c=>c!==channel) : [...current,channel])} /><span className="channel-logo" aria-hidden="true">{channel === "linkedin" ? "in" : channel === "x" ? "𝕏" : "@"}</span><strong>{CHANNEL_LABELS[channel]}</strong><small>{channel === "newsletter" ? "Email edition" : "Ready to copy & post"}</small></label>)}</fieldset>
+        <details className="schedule-details"><summary>Scheduling preferences <span className="muted">{schedule === "hold" ? "Decide after review" : schedule === "now" ? "After approval" : "Specific time"}</span></summary><div className="stack mt-2">{[{value:"hold",label:"Decide after reviewing the content"},{value:"now",label:"Release as soon as I approve"},{value:"later",label:"Choose a date and time"}].map(option=><label className="check" key={option.value}><input type="radio" name="schedule" checked={schedule===option.value} onChange={()=>setSchedule(option.value as typeof schedule)} />{option.label}</label>)}{schedule === "later" && <div className="field"><label htmlFor="publish-at">Publish time (your local time)</label><input id="publish-at" type="datetime-local" required value={publishAt} onChange={e=>setPublishAt(e.target.value)} /></div>}</div></details>
+      </section>
     </div>
-  );
-}
-
-/** Mirrors estimateRequestCost on the server (§18.3). */
-function estimate(seedUrlCount: number, channelCount: number): number {
-  const search = seedUrlCount === 0 ? 4 : 0;
-  const scrapes = Math.max(seedUrlCount, 6) * 0.1;
-  return Math.ceil(search + scrapes + 0.1 + 1 + 5 + 3.5 + 3 + channelCount * 0.35);
+    <aside className="create-sidebar"><div className="brief-summary"><div className="eyebrow">YOUR CONTENT PLAN</div><h2>One idea. More possibilities.</h2><div className="summary-deliverable"><Icon name="file" /><div><strong>Source-backed article</strong><small>With an SEO title and description</small></div></div><div className="summary-deliverable"><Icon name="grid" /><div><strong>{channels.length} channel {channels.length === 1 ? "version" : "versions"}</strong><small>{channels.map(c=>CHANNEL_LABELS[c]).join(" · ") || "Select at least one channel"}</small></div></div><div className="estimate-block"><div><span>Estimated AI cost</span><strong>${(estimateCents / 100).toFixed(2)}</strong></div><p>Includes research, writing, checks, one revision, and your selected channels. Actual usage varies.</p></div><div className="field"><label htmlFor="budget">Spending limit (USD)</label><input id="budget" type="number" required min={0.1} max={budgetCapCents ? budgetCapCents / 100 : 100} step={0.01} value={budget} onChange={e=>setBudget(e.target.value)} /><div className="hint">{budgetCapCents ? `Demo limit: $${(budgetCapCents / 100).toFixed(2)} per request.` : "Work pauses before the next call would exceed this limit."}</div></div>{(overCap || overBudget) && <div className="alert alert-warn small">{overCap ? "This budget exceeds the workspace limit." : "Raise the limit to cover the estimate, or select fewer channels."}</div>}<button type="submit" className="btn btn-primary btn-full" disabled={!canSubmit}>{pending ? <><span className="spin" />Creating your brief…</> : <>Start creating<Icon name="arrow" size={17} /></>}</button><p className="submission-note">You’ll review sources and choose an angle before writing begins.</p></div><div className="creation-promise"><Icon name="check" size={18} /><span>You stay in control.<br /><strong>Every channel needs your approval.</strong></span></div></aside>
+  </form>;
 }

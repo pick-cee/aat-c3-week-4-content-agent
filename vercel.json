@@ -1,7 +1,7 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "functions": {
-    "src/app/api/runner/route.ts": { "maxDuration": 60 },
-    "src/app/api/cron/release/route.ts": { "maxDuration": 60 }
+    "src/app/api/runner/route.ts": { "maxDuration": 300 },
+    "src/app/api/cron/release/route.ts": { "maxDuration": 300 }
   }
 }

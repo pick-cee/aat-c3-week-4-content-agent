@@ -9,14 +9,13 @@ import "server-only";
  * `/api/health` reports the real state either way (DESIGN.md §20).
  */
 export async function runStartup(): Promise<void> {
+  // Deployment normally applies migrations; local startup can explicitly opt in.
+  if (process.env.AUTO_MIGRATE !== "true") return;
   const { ensureSchema } = await import("./migrate");
   const { seedIfEmpty } = await import("./seed");
 
   await ensureSchema();
   await seedIfEmpty();
 
-  // The queue keeps its own schedule from here: a send time is a promise the
-  // app has to keep whether or not anyone has a page open.
-  const { startScheduler } = await import("../publish/scheduler");
-  startScheduler();
+  // A separate `npm run worker` process drives research and publishing.
 }

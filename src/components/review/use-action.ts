@@ -31,9 +31,11 @@ export function useAction(): ActionState {
   function run(fn: () => Promise<{ ok: boolean; error?: string }>) {
     setError(null);
     startTransition(async () => {
-      const result = await fn();
-      if (!result.ok) setError(result.error ?? "That did not work.");
-      else router.refresh();
+      try {
+        const result = await fn();
+        if (!result.ok) setError(result.error ?? "That did not work.");
+        else router.refresh();
+      } catch { setError("Connection interrupted. Refresh to check whether the change was saved before trying again."); }
     });
   }
 

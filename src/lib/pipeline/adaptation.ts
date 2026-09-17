@@ -1,4 +1,6 @@
 import "server-only";
+import { PermanentPipelineError } from "./errors";
+import { assertExecutionActive } from "./execution";
 import { serviceClient, table } from "@/lib/db/client";
 import { logInfo, logWarn } from "@/lib/log";
 import { callStructured, recordDiscarded } from "@/lib/providers/anthropic";
@@ -23,22 +25,6 @@ import type {
   FormatCheckResult,
 } from "@/lib/db/types";
 
-/**
- * Channel adaptation. DESIGN.md §12.
- *
- * Model: Haiku 4.5. Short outputs, explicit formatting rules, low judgment.
- *
- * The structural guarantee (§2.8, rule 4): input is the approved article, the
- * brand voice and the channel rules, and NOTHING ELSE. No excerpts, no web
- * access, no source corpus. "The adapter physically cannot introduce a claim
- * that is not in the article."
- *
- * Markers are inherited and checked against the article's claim map; anything
- * else is a hard failure and a retry.
- */
-
-// ─── Schemas, one per channel ───────────────────────────────────────────────
-
 export const LINKEDIN_SCHEMA = {
   type: "object",
   additionalProperties: false,
@@ -58,8 +44,6 @@ export const X_SCHEMA = {
   required: ["body", "hashtags", "coreIdea"],
   properties: {
     body: { type: "string", description: "The post, including hashtags and line breaks." },
-    // No minItems/maxItems: structured outputs reject array length constraints.
-    // The count is stated here and enforced by checkX (§12.1).
     hashtags: {
       type: "array",
       description: "One or two relevant hashtags. Never three.",
@@ -99,24 +83,14 @@ interface AdapterOutput {
   solution?: string;
 }
 
-// ─── Adaptation ─────────────────────────────────────────────────────────────
-
 export interface AdaptResult {
   channel: ChannelName;
   output: ChannelOutput | null;
   formatCheck: FormatCheckResult;
-  /** True when the channel gave up after its retry (§12.1). */
+
   formatFailed: boolean;
 }
 
-/**
- * Adapts one channel. One retry on a format failure, with the specific
- * violation and the actual measured value named.
- *
- * A second failure marks that channel `format_failed` and surfaces it at gate
- * two — the other channels still proceed. One broken channel never blocks the
- * others (§12.1).
- */
 export async function adaptChannel(
   request: ContentRequest,
   version: ArticleVersion,
@@ -131,9 +105,6 @@ export async function adaptChannel(
   };
 
   const claimMap = (version.claim_map ?? []) as ClaimMapEntry[];
-  // X's link is optional and off by default — an X post that earns a click on
-  // its own hook outperforms one that spends its first line asking for it
-  // (§12.2).
   const includeLink = channel !== "x" && Boolean(articleUrl);
 
   const system = [
@@ -172,10 +143,6 @@ export async function adaptChannel(
       temperature: 1,
     });
 
-    lastOutput = result.value;
-
-    // Markers are inherited: anything outside the article's claim map is a
-    // hard failure, because it means the adapter invented a citation (§12).
     const inherited = checkInheritedMarkers(result.value.body, claimMap);
     if (!inherited.valid) {
       await recordDiscarded(
@@ -183,14 +150,20 @@ export async function adaptChannel(
         MODELS.adaptation,
         result.usage,
         `Cited ${inherited.unknownLabels.join(", ")}, which the article does not.`,
+      result.callId,
       );
       retryNote =
         `── YOUR PREVIOUS ATTEMPT WAS DISCARDED ──\n` +
         `You cited ${inherited.unknownLabels.join(", ")}, which do not appear in the article. ` +
         `Use only markers that are already in the article text.`;
       attempt++;
+      if (attempt > CHANNEL_FORMAT_RETRIES) {
+        throw new PermanentPipelineError("The channel repeatedly cited sources absent from the article. Its output was not saved.");
+      }
       continue;
     }
+
+    lastOutput = result.value;
 
     const check = runFormatCheck(channel, result.value, voice, includeLink ? articleUrl : null);
     lastCheck = check;
@@ -215,10 +188,8 @@ export async function adaptChannel(
       MODELS.adaptation,
       result.usage,
       `Format check failed: ${failures.map((f) => f.detail).join("; ")}`,
+      result.callId,
     );
-
-    // The retry names the specific violation AND the actual measured value —
-    // a model told the real number usually fixes it (§12.1).
     retryNote =
       `── YOUR PREVIOUS ATTEMPT FAILED THESE CHECKS ──\n` +
       failures.map((f) => `- ${f.name}: ${f.detail}`).join("\n") +
@@ -227,16 +198,7 @@ export async function adaptChannel(
     attempt++;
   }
 
-  /**
-   * Last resort for X: cut it to fit.
-   *
-   * Length is the only format rule with an exact mechanical answer, so telling
-   * a founder "cut at least 46 characters" is handing them arithmetic instead
-   * of a finished post. Everything else — too few hashtags, no line break, a
-   * missing core idea — is a judgment call and still goes to a person.
-   *
-   * The trim is recorded on the row so the edit is visible rather than silent.
-   */
+
   if (channel === "x" && lastOutput && overLengthOnly(lastCheck)) {
     const trimmedBody = trimXPost(lastOutput.body, lastOutput.hashtags ?? []);
     const trimmed = { ...lastOutput, body: trimmedBody };
@@ -264,8 +226,6 @@ export async function adaptChannel(
       return { channel, output, formatCheck: recheck, formatFailed: false };
     }
   }
-
-  // Second failure: format_failed on THIS channel only (§12.1).
   const output = lastOutput
     ? await saveOutput({
         request,
@@ -291,13 +251,6 @@ export async function adaptChannel(
   return { channel, output, formatCheck: lastCheck, formatFailed: true };
 }
 
-/**
- * True when length is the ONLY thing wrong.
- *
- * Trimming fixes length and nothing else, so a post that is also missing its
- * hashtags or its core idea still needs a person. Checking this rather than
- * trimming on any failure is what keeps the automatic edit safe.
- */
 function overLengthOnly(check: FormatCheckResult): boolean {
   const failed = check.checks.filter((c) => !c.passed);
   return failed.length > 0 && failed.every((c) => c.name.includes("Within 280 characters"));
@@ -309,9 +262,6 @@ function runFormatCheck(
   voice: BrandVoice | null,
   articleUrl: string | null,
 ): FormatCheckResult {
-  // Checks run against what a READER sees: markers are an internal mechanism
-  // and are stripped before the post goes out, so counting them against the
-  // character limit would reject posts that are actually within it.
   const body = stripMarkers(output.body);
 
   switch (channel) {
@@ -385,8 +335,6 @@ function channelLabel(channel: ChannelName): string {
   }
 }
 
-// ─── Persistence ────────────────────────────────────────────────────────────
-
 interface SaveOutputInput {
   request: ContentRequest;
   version: ArticleVersion;
@@ -396,20 +344,14 @@ interface SaveOutputInput {
   articleUrl: string | null;
   status: "draft" | "format_failed";
   usage: { inputTokens: number; outputTokens: number };
-  /** Set when the body was shortened in code to fit the channel limit. */
+
   autoTrimmed?: boolean;
 }
 
 async function saveOutput(input: SaveOutputInput): Promise<ChannelOutput> {
+  await assertExecutionActive();
   const db = serviceClient();
   const { request, version, channel, result, check, articleUrl, status } = input;
-
-  // Stored as the reader will see it. The markers did their job at check time
-  // and have no business reaching a recipient.
-  //
-  // Em dashes go the same way as in the article (saveVersion): the prompt
-  // forbids them and this is the mechanical guarantee, applied to the subject
-  // line and the CTA as well since those are read as carefully as the body.
   const readerBody = replaceEmDashes(stripMarkers(result.body));
 
   const claimMap = (version.claim_map ?? []) as ClaimMapEntry[];
@@ -463,10 +405,6 @@ async function saveOutput(input: SaveOutputInput): Promise<ChannelOutput> {
   return data as unknown as ChannelOutput;
 }
 
-/**
- * Adapts every requested channel. One broken channel never blocks the others,
- * so each is caught independently (§12.1).
- */
 export async function adaptAllChannels(
   request: ContentRequest,
   version: ArticleVersion,
@@ -479,8 +417,6 @@ export async function adaptAllChannels(
     try {
       results.push(await adaptChannel(request, version, voice, channel, articleUrl));
     } catch (err) {
-      // A thrown error here is a provider or budget failure, not a format one.
-      // The channel is recorded as failed and the rest still run.
       results.push({
         channel,
         output: null,

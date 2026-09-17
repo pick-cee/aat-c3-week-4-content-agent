@@ -1,6 +1,7 @@
 "use client";
 
-import { chooseImage } from "@/app/actions/approvals";
+import { useState } from "react";
+import { chooseImage, findImages } from "@/app/actions/approvals";
 import { useAction } from "./use-action";
 import type { ImageCandidate } from "@/lib/db/types";
 
@@ -23,15 +24,9 @@ export function ImagePanel({
 }) {
   const action = useAction();
   const pending = action.pending;
+  const [alts, setAlts] = useState<Record<string,string>>({});
   const readOnly = locked;
-  if (images.length === 0) {
-    return (
-      <p className="small muted">
-        No openly licensed images were found for this article. That is fine, an image is
-        optional, and one with no licence on record is never attached.
-      </p>
-    );
-  }
+  if (images.length === 0) return <div className="empty"><h3>No image candidates available yet</h3><p>Licensed photos are searched automatically during article checks. If none are available, you can try again. Image search does not use AI tokens.</p>{action.error && <div className="alert alert-warn small">{action.error}</div>}{!readOnly && <button className="btn" disabled={pending} onClick={()=>action.run(()=>findImages(requestId))}>{pending ? "Searching..." : "Find images"}</button>}</div>;
 
   return (
     <div className="stack">
@@ -75,12 +70,13 @@ export function ImagePanel({
               </>
             )}
           </div>
+          {!readOnly && !image.chosen && <div className="field mt-2"><label htmlFor={"alt-" + image.id}>Describe the image for readers using a screen reader</label><input id={"alt-" + image.id} maxLength={200} value={alts[image.id] ?? image.alt_text ?? ""} placeholder="e.g. A team reviewing notes around a desk" onChange={e=>setAlts({...alts,[image.id]:e.target.value})} /></div>}
           {!readOnly && (
             <button
               className="btn btn-sm mt-1"
-              disabled={pending}
+              disabled={pending || (!image.chosen && !(alts[image.id] ?? image.alt_text)?.trim())}
               onClick={() =>
-                action.run(() => chooseImage(requestId, image.chosen ? null : image.id))
+                action.run(() => chooseImage(requestId, image.chosen ? null : image.id, alts[image.id] ?? image.alt_text ?? ""))
               }
             >
               {image.chosen ? "Remove" : "Use this one"}

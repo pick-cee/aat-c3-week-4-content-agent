@@ -1,5 +1,6 @@
 import "server-only";
 import { serviceClient, table } from "@/lib/db/client";
+import { assertExecutionActive } from "./execution";
 import { logWarn } from "@/lib/log";
 import { callStructured } from "@/lib/providers/anthropic";
 import {
@@ -51,9 +52,13 @@ export async function findImageCandidates(
   request: ContentRequest,
   version: ArticleVersion,
 ): Promise<ImageCandidate[]> {
-  const query = buildQuery(version);
-
   try {
+    const existing = await serviceClient().from(table("images")).select("*").eq("request_id", request.id);
+    if (existing.error) throw new Error(existing.error.message);
+    if (existing.data?.length) return existing.data as unknown as ImageCandidate[];
+
+    const signal = AbortSignal.timeout(12_000);
+    for (const query of buildImageQueries(version)) {
     const url = new URL(OPENVERSE_API);
     url.searchParams.set("q", query);
     url.searchParams.set("page_size", String(IMAGE_CANDIDATE_COUNT));
@@ -64,7 +69,7 @@ export async function findImageCandidates(
 
     const response = await fetch(url, {
       headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(15_000),
+      signal,
     });
 
     if (!response.ok) {
@@ -80,7 +85,7 @@ export async function findImageCandidates(
 
     const rows = results
       // A candidate missing licence metadata is discarded, not defaulted (§13).
-      .filter((r) => r.license && r.url)
+      .filter((r) => r.license && ["cc0", "pdm", "by", "by-sa"].includes(r.license.toLowerCase()) && /^https:\/\//i.test(r.url))
       .map((r) => ({
         request_id: request.id,
         provider: "openverse",
@@ -96,8 +101,9 @@ export async function findImageCandidates(
         chosen: false,
       }));
 
-    if (rows.length === 0) return [];
+    if (rows.length === 0) continue;
 
+    await assertExecutionActive();
     const { data, error } = await serviceClient().from(table("images")).insert(rows).select();
     if (error) {
       await logWarn("Could not store the image candidates. Continuing without an image.", {
@@ -109,27 +115,31 @@ export async function findImageCandidates(
     }
 
     return (data ?? []) as unknown as ImageCandidate[];
+    }
+    return [];
   } catch (err) {
     await logWarn("Image search was unavailable. Continuing without an image.", {
       requestId: request.id,
       step: "image",
       detail: { error: String(err) },
-    });
+    }).catch(() => undefined);
     return [];
   }
 }
 
-function buildQuery(version: ArticleVersion): string {
-  // The keyword alone is usually too abstract to return a usable photograph,
-  // and the full title is too specific. Keyword plus the title's concrete
-  // nouns is what actually matches stock imagery.
+export function buildImageQueries(version: Pick<ArticleVersion, "title" | "primary_keyword">): string[] {
+  const keyword = (version.primary_keyword ?? "").replace(/[-_]/g, " ").trim();
+  const subject = `${keyword} ${version.title}`;
+  // Use a short visual subject instead of appending an entire abstract headline.
+  const concrete = /\b(hir(?:e|ing)|recruit\w*|resumes?|candidates?|screening|talent)\b/i.test(subject)
+    ? "job interview" : null;
   const words = version.title
     .replace(/[^\p{L}\p{N}\s]/gu, " ")
     .split(/\s+/)
     .filter((w) => w.length > 3)
-    .slice(0, 4);
+    .slice(0, 2);
 
-  return [version.primary_keyword, ...words].filter(Boolean).join(" ").slice(0, 80);
+  return [...new Set([concrete ?? keyword, concrete ? "office meeting" : words.join(" ")].filter(Boolean))].slice(0, 2);
 }
 
 function formatLicence(result: OpenverseResult): string {
@@ -210,6 +220,10 @@ export async function storeChosenImage(image: ImageCandidate): Promise<string | 
     if (!response.ok) return null;
 
     const contentType = response.headers.get("content-type") ?? "image/jpeg";
+    if (!/^image\/(jpeg|png|webp)(?:;|$)/i.test(contentType)) return null;
+    if (Number(response.headers.get("content-length")) > 10_000_000) return null;
+    const data = await response.arrayBuffer();
+    if (data.byteLength > 10_000_000) return null;
     const extension = contentType.includes("png")
       ? "png"
       : contentType.includes("webp")
@@ -218,8 +232,8 @@ export async function storeChosenImage(image: ImageCandidate): Promise<string | 
     const path = `articles/${image.request_id}/${image.id}.${extension}`;
 
     const { error } = await db.storage
-      .from(table("images"))
-      .upload(path, await response.arrayBuffer(), { contentType, upsert: true });
+      .from("images")
+      .upload(path, data, { contentType, upsert: true });
 
     if (error) return null;
 

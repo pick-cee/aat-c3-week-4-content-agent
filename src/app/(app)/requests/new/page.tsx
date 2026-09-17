@@ -13,21 +13,21 @@ export default async function NewRequestPage() {
   const profile = await currentProfile();
   if (!profile) redirect("/");
 
-  const { data } = await serviceClient()
+  const { data, error } = await serviceClient()
     .from(table("brand_voices"))
     .select("*")
     .order("is_default", { ascending: false });
 
   const voices = (data ?? []) as unknown as BrandVoice[];
+  if (error) throw new Error("Could not load your brand voices. Please refresh.");
 
   return (
     <>
       <div className="page-head">
         <div>
-          <h1>New content request</h1>
+          <div className="workspace-eyebrow">CONTENT LIBRARY / NEW CONTENT</div><h1>What are we creating?</h1>
           <p>
-            An idea, a URL, or both. You will confirm the sources and pick an angle before
-            anything is written.
+            Turn a good idea into an article and channel-ready content. Start with a brief.
           </p>
         </div>
       </div>

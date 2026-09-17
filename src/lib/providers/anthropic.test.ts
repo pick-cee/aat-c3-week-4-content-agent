@@ -75,6 +75,11 @@ describe("parseFencedJson", () => {
     expect(parseFencedJson('```json\n{"a":1,}\n```')).toEqual({ a: 1 });
   });
 
+  it("preserves URLs, comment-like text and punctuation when repairing", () => {
+    expect(parseFencedJson('{"url":"https://example.com/a", "quote":"x,} /* evidence */", // comment\n}'))
+      .toEqual({ url: "https://example.com/a", quote: "x,} /* evidence */" });
+  });
+
   it("repairs single-quoted keys and values", () => {
     expect(parseFencedJson("```json\n{'a': 'b'}\n```")).toEqual({ a: "b" });
   });

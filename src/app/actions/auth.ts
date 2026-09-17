@@ -2,8 +2,8 @@
 
 import { redirect } from "next/navigation";
 import { headers } from "next/headers";
-import { userClient } from "@/lib/db/client";
-import { checkRateLimit, bumpCounter } from "@/lib/cost";
+import { userClient, serviceClient, table } from "@/lib/db/client";
+import { consumeRateLimit } from "@/lib/cost";
 import { env } from "@/lib/env";
 import { DEMO_ACCOUNT } from "@/lib/personas";
 
@@ -28,9 +28,10 @@ import { DEMO_ACCOUNT } from "@/lib/personas";
  * a sign-in that fails silently is exactly the bug this shape avoids.
  */
 export async function signInAsDemo(): Promise<void> {
+  if (!env.app.demoLoginEnabled) redirect("/?error=Demo+access+is+disabled+for+this+workspace.");
   const ip = await clientIp();
 
-  const check = await checkRateLimit(
+  const check = await consumeRateLimit(
     "ip",
     ip,
     "day",
@@ -63,14 +64,38 @@ export async function signInAsDemo(): Promise<void> {
     );
   }
 
-  await bumpCounter("ip", ip, "day", "demo_signin");
-
   redirect("/");
 }
 
 export async function signOut(): Promise<void> {
   const supabase = await userClient();
   await supabase.auth.signOut();
+  redirect("/");
+}
+
+/** Accounts are provisioned by the agency; this does not enable public signup. */
+export async function signIn(form: FormData): Promise<void> {
+  const email = String(form.get("email") ?? "").trim();
+  const password = String(form.get("password") ?? "");
+  const ip = await clientIp();
+  const limit = await consumeRateLimit("ip", ip, "hour", "password_signin", 12);
+  if (!limit.allowed) redirect("/?error=Too+many+sign-in+attempts.+Try+again+later.");
+  if (!email || !password || email.length > 254 || password.length > 1024) redirect("/?error=Enter+your+email+and+password.");
+  const client = await userClient();
+  const { data, error } = await client.auth.signInWithPassword({ email, password });
+  if (error) redirect("/?error=The+email+or+password+was+not+recognised.");
+  const { data: member, error: memberError } = await serviceClient().from(table("profiles"))
+    .select("id, is_demo").eq("id", data.user.id).maybeSingle();
+  if (memberError || !member) {
+    await client.auth.signOut();
+    redirect(memberError
+      ? "/?error=Workspace+access+could+not+be+verified.+Please+try+again."
+      : "/?error=This+account+does+not+have+access+to+this+workspace.");
+  }
+  if (member.is_demo && !env.app.demoLoginEnabled) {
+    await client.auth.signOut();
+    redirect("/?error=Demo+access+is+disabled+in+this+environment.+Use+a+workspace+account.");
+  }
   redirect("/");
 }
 

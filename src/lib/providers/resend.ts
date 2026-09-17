@@ -65,9 +65,9 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
       {
         from: env.resend.from,
         to,
-        subject: demo ? `[DRY RUN → ${intendedTo}] ${input.subject}` : input.subject,
-        html: demo ? demoBanner(intendedTo) + input.html : input.html,
-        text: demo ? `[DRY RUN, intended for ${intendedTo}]\n\n${input.text}` : input.text,
+        subject: input.subject,
+        html: input.html,
+        text: input.text,
         ...(input.replyTo ? { replyTo: input.replyTo } : {}),
       },
       input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : undefined,
@@ -104,12 +104,6 @@ export async function sendEmail(input: SendInput): Promise<SendResult> {
       retryable: true,
     };
   }
-}
-
-function demoBanner(intendedTo: string): string {
-  return `<div style="background:#fef3c7;border:1px solid #f59e0b;padding:12px;margin-bottom:20px;font-family:system-ui,sans-serif;font-size:14px;color:#78350f;border-radius:6px">
-<strong>Dry run.</strong> DEMO_MODE is on, so this was redirected here instead of going to <code>${escapeHtml(intendedTo)}</code>. Nothing was sent to the real recipient.
-</div>`;
 }
 
 /**

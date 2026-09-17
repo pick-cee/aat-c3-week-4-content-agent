@@ -1,5 +1,17 @@
 # CLAUDE.md
 
+## Current implementation
+
+The September 2026 amendments at the top of `DESIGN.md`, `README.md` and
+`REFACTOR.md` supersede conflicting historical details in this file. Use the
+dedicated worker, transactional provider reservations, current model routing,
+explicit database deployment and private-until-approved article rules. Images
+are optional after drafting; alt text is entered by a person. Do not restore
+the old double-claim scheduler, implicit startup migrations, anonymous draft
+policies or hidden provider retries. Run the regression suite and production
+build before handing off a change. Never claim a measured speed improvement
+without an actual generation benchmark.
+
 Standing context for this repository. Read `DESIGN.md` before writing code — it
 is the specification and it wins over convenience. Read `PRD.md` for the brief
 and `assets/` for the SEO rules, channel formatting rules and evaluation rubric,

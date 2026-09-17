@@ -1,4 +1,5 @@
 import "server-only";
+import { cache } from "react";
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import { createServerClient } from "@supabase/ssr";
 import { cookies } from "next/headers";
@@ -91,7 +92,7 @@ export async function userClient(): Promise<SupabaseClient<Database>> {
  * The signed-in profile, or null. Every server action that mutates starts here
  * — the UI is not a security boundary (DESIGN.md §14.3).
  */
-export async function currentProfile() {
+export const currentProfile = cache(async function currentProfile() {
   const supabase = await userClient();
   const {
     data: { user },
@@ -120,8 +121,9 @@ export async function currentProfile() {
     return null;
   }
 
+  if (data?.is_demo && !env.app.demoLoginEnabled) return null;
   return data ?? null;
-}
+});
 
 export type CurrentProfile = NonNullable<Awaited<ReturnType<typeof currentProfile>>>;
 

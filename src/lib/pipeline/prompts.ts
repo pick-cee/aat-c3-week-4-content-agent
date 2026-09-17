@@ -175,6 +175,7 @@ export function channelRulesBlock(channel: ChannelName, emojiAllowance: number):
 - Use the PAS structure: Problem, then Agitation, then Solution, in that order.
   You will declare the three spans separately, and they are checked for order
   and non-overlap.
+- Aim for 180–240 words and roughly 1,600–2,200 characters, leaving room below the hard limit.
 - Short paragraphs, at most ${CHANNEL_LIMITS.linkedin.maxLinesPerParagraph} lines each.
 - Bullets or simple symbols where they genuinely improve clarity.
 - At most ${emojiAllowance} emoji, and only where they fit the brand voice.
@@ -217,11 +218,14 @@ spend characters on them.`;
 - A subject line with a clear benefit or a point of intrigue, at most
   ${CHANNEL_LIMITS.newsletter.maxSubjectChars} characters.
 - Open with ${CHANNEL_LIMITS.newsletter.minIntroSentences} to ${CHANNEL_LIMITS.newsletter.maxIntroSentences} sentences.
+- Aim for exactly TWO introductory sentences, then insert a blank line before the main section.
 - Make the main value section skimmable: at least
   ${CHANNEL_LIMITS.newsletter.minSubheadings} subheadings, or a bulleted block.
 - Optionally add a secondary item, a quick tip, a link, an update.
 - A clear call to action.
 - A friendly sign-off.
+- End with a separate two-line sign-off, such as "Best," followed by "Koya Talent" on the next line.
+- Aim for 350–450 words in total, including the introduction, CTA and sign-off. Leave room below the upper limit.
 - Between ${CHANNEL_LIMITS.newsletter.minWords} and ${CHANNEL_LIMITS.newsletter.maxWords} words. This is
   counted mechanically and is a hard failure outside the band.
 - Write as though speaking to a smart, busy reader who trusts you to send

@@ -5,7 +5,7 @@ import { scrape, isUsableSource } from "@/lib/providers/firecrawl";
 import { callWithSearch } from "@/lib/providers/anthropic";
 import { embed, toVectorLiteral, EmbeddingError } from "@/lib/providers/embeddings";
 import { chunkMarkdown } from "./chunking";
-import { priceScrapes, recordModelCall } from "@/lib/cost";
+import { priceScrapes, recordModelCall, assertWithinBudget, BudgetExceededError } from "@/lib/cost";
 import {
   canonicaliseUrl,
   isValidUrl,
@@ -25,17 +25,6 @@ import {
 } from "@/lib/constants";
 import type { ContentRequest, Source } from "@/lib/db/types";
 
-/**
- * Research: discovery → fetch → chunk_embed → score. DESIGN.md §7.
- *
- * Each is a separate runner step, resumable from what is already in the table
- * (§3.1), because the whole sequence — a search call, six scrapes with
- * retries, chunking and an embedding batch — does not reliably finish inside a
- * serverless function's execution budget.
- */
-
-// ─── Step: discover (§7.1, §7.2) ────────────────────────────────────────────
-
 interface DiscoveredSource {
   url: string;
   title?: string;
@@ -47,25 +36,18 @@ export interface DiscoverResult {
   seeded: number;
   discovered: number;
   queries: string[];
-  /** 'no_sources_found' stops the request at needs_human, not at an article. */
+
   outcome: "ok" | "no_sources_found";
 }
 
 export async function stepDiscover(request: ContentRequest): Promise<DiscoverResult> {
   const db = serviceClient();
   const seedUrls = request.seed_urls ?? [];
-
-  // Seed URLs are inserted first and always, search or no search.
-  let seeded = 0;
+  let seeded = seedUrls.length;
   for (const url of seedUrls) {
     if (!isValidUrl(url)) continue;
-    const inserted = await insertSource(request.id, url, "seed", null);
-    if (inserted) seeded++;
+    await insertSource(request.id, url, "seed", null);
   }
-
-  // §7.2: seed URLs skip search entirely. This is a deliberate $10/1000 saved
-  // on every URL-based request, and it is the answer to "when should this
-  // automation NOT run".
   const needsSearch = seedUrls.length === 0 || wantsTopUp(request);
 
   if (!needsSearch) {
@@ -95,16 +77,7 @@ export async function stepDiscover(request: ContentRequest): Promise<DiscoverRes
             "Prefer primary sources, original research, official documentation and named " +
             "publications. Avoid listicles, SEO farms and pages that only summarise other " +
             "pages.\n\n" +
-            /**
-             * Roughly half of what a search returns cannot be read: pages
-             * behind a login, sites that block scrapers, single-page apps that
-             * render nothing server-side, placeholders. A run that asked for
-             * 3-8 came back with 7 and ended up with ONE real article, which
-             * made everything downstream fail.
-             *
-             * Naming the failure modes is what moves the number, not asking
-             * for more results.
-             */
+
             "IMPORTANT, many pages cannot be read once fetched, so choose for " +
             "READABILITY as well as relevance:\n" +
             "- Prefer pages that render their article as plain HTML.\n" +
@@ -119,7 +92,7 @@ export async function stepDiscover(request: ContentRequest): Promise<DiscoverRes
             '[{"url": "...", "title": "...", "why": "one line on what this contributes", ' +
             '"confidence": 0.0}]\n' +
             "```\n" +
-            "Return 8 to 12 results, expect several to be unreadable, so breadth " +
+            "Return 5 to 6 strong results, expect some to be unreadable, so breadth " +
             "matters. `confidence` is 0 to 1. Every url must be one you " +
             "actually saw in a search result, do not construct or guess a URL.",
         },
@@ -129,8 +102,10 @@ export async function stepDiscover(request: ContentRequest): Promise<DiscoverRes
 
     queries = result.queries;
 
-    for (const item of result.value ?? []) {
+    const verifiedUrls = new Set(result.citedUrls.map(url => canonicaliseUrl(url)));
+    for (const item of (result.value ?? []).slice(0, 6)) {
       if (!item?.url || !isValidUrl(item.url)) continue;
+      if (!verifiedUrls.has(canonicaliseUrl(item.url))) continue;
       const inserted = await insertSource(
         request.id,
         item.url,
@@ -146,8 +121,7 @@ export async function stepDiscover(request: ContentRequest): Promise<DiscoverRes
       .update({ research_queries: { queries, resultCount: discovered } })
       .eq("id", request.id);
   } catch (err) {
-    // A failed search when the manager supplied URLs is survivable: proceed on
-    // what they gave us rather than failing the request (§7.3, partial success).
+    if (err instanceof BudgetExceededError) throw err;
     if (seeded > 0) {
       await logWarn(
         "The web search failed, so research is continuing with only the URLs you supplied.",
@@ -161,8 +135,6 @@ export async function stepDiscover(request: ContentRequest): Promise<DiscoverRes
   const total = seeded + discovered;
 
   if (total === 0) {
-    // §7.1: zero results is NOT a failure and NOT an empty article. Week 2's
-    // lesson — a zero that looks like a number is worse than an error.
     await db
       .from(table("content_requests"))
       .update({ research_outcome: "no_sources_found", research_queries: { queries } })
@@ -186,13 +158,9 @@ export async function stepDiscover(request: ContentRequest): Promise<DiscoverRes
   return { seeded, discovered, queries, outcome: "ok" };
 }
 
-/**
- * A request with seed URLs AND a broad idea runs one search with max_uses: 2
- * to top up (§7.2). "Broad" is judged on the idea asking for more than the
- * supplied pages can answer.
- */
+
 function wantsTopUp(request: ContentRequest): boolean {
-  return /\b(research|find|latest|trends?|compare|landscape|state of|examples?|statistics|data)\b/i.test(
+  return /\b(additional sources|more sources|search the web|find more|expand the research)\b/i.test(
     request.idea,
   );
 }
@@ -214,11 +182,7 @@ function buildDiscoveryPrompt(request: ContentRequest, seedUrls: string[]): stri
   return parts.join("\n");
 }
 
-/**
- * Insert is idempotent on (request_id, url_canonical), so the same article at
- * two URLs with tracking params becomes one source (§5.4, §21.1). Returns
- * false when the row already existed.
- */
+
 async function insertSource(
   requestId: string,
   url: string,
@@ -243,55 +207,48 @@ async function insertSource(
     site_name: siteNameFromUrl(url),
     fetch_status: "pending",
   });
-
-  // A duplicate is the constraint doing its job, not an error.
-  if (error) return !error.message.includes("duplicate");
+  if (error) {
+    if (error.code === "23505") return false;
+    throw new Error(`Could not save a source: ${error.message}`);
+  }
   return true;
 }
-
-// ─── Step: fetch (§7.3) ─────────────────────────────────────────────────────
 
 export interface FetchStepResult {
   attempted: number;
   succeeded: number;
   failed: number;
   remaining: number;
-  /** True when every pending URL has now been attempted. */
+
   complete: boolean;
 }
 
-/**
- * Fetches up to FETCH_BATCH_SIZE pending URLs, then returns. Sized to fit the
- * function budget; the runner calls it again while `complete` is false (§3.1).
- */
+
 export async function stepFetch(request: ContentRequest): Promise<FetchStepResult> {
   const db = serviceClient();
 
-  const { data: pending } = await db
+  const { data: pending, error: pendingError } = await db
     .from(table("sources"))
     .select("id, url, url_canonical")
     .eq("request_id", request.id)
     .eq("fetch_status", "pending")
     .limit(FETCH_BATCH_SIZE);
 
+  if (pendingError) throw new Error(`Could not load sources: ${pendingError.message}`);
   if (!pending || pending.length === 0) {
     return { attempted: 0, succeeded: 0, failed: 0, remaining: 0, complete: true };
   }
 
   let succeeded = 0;
   let failed = 0;
-  let credits = 0;
-
-  // Concurrency capped at 4 (§7.3).
   for (let i = 0; i < pending.length; i += FETCH_CONCURRENCY) {
     const batch = pending.slice(i, i + FETCH_CONCURRENCY);
 
-    await Promise.all(
+    const fetched = await Promise.allSettled(
       batch.map(async (source) => {
-        const result = await scrape(source.url as string);
-        credits += result.creditsUsed;
+        const result = await scrape(source.url as string, request.id);
 
-        await db
+        const { error: saveError } = await db
           .from(table("sources"))
           .update({
             fetch_status: result.status,
@@ -307,36 +264,26 @@ export async function stepFetch(request: ContentRequest): Promise<FetchStepResul
             from_cache: result.fromCache,
             credits_used: result.creditsUsed,
             fetched_at: new Date().toISOString(),
-            // A source that could not be read is unchecked by default but
-            // still visible at gate one and on the public source list (§5.4).
             included: isUsableSource(result.status),
           })
           .eq("id", source.id as string);
 
+        if (saveError) throw new Error(saveError.message);
         if (isUsableSource(result.status)) succeeded++;
         else failed++;
       }),
     );
+    const failure = fetched.find((r): r is PromiseRejectedResult => r.status === "rejected");
+    if (failure) throw failure.reason;
   }
 
-  if (credits > 0) {
-    await recordModelCall({
-      requestId: request.id,
-      step: "fetch",
-      purpose: `${credits} Firecrawl scrape credit(s)`,
-      model: "firecrawl",
-      usage: { inputTokens: 0, outputTokens: 0 },
-      outcome: "used",
-      costCentsOverride: priceScrapes(credits),
-    });
-  }
-
-  const { count: remaining } = await db
+  const { count: remaining, error: remainingError } = await db
     .from(table("sources"))
     .select("id", { count: "exact", head: true })
     .eq("request_id", request.id)
     .eq("fetch_status", "pending");
 
+  if (remainingError) throw new Error("Could not check unread sources: " + remainingError.message);
   return {
     attempted: pending.length,
     succeeded,
@@ -346,13 +293,7 @@ export async function stepFetch(request: ContentRequest): Promise<FetchStepResul
   };
 }
 
-/**
- * Decides whether research produced enough to proceed (§7.3).
- *
- * "Partial research is a valid outcome and must look like one." Four of six
- * fetching is fine. Zero stops. Fewer than two with no seed URLs stops —
- * one source is not research.
- */
+
 export async function assessResearch(request: ContentRequest): Promise<{
   ok: boolean;
   usable: number;
@@ -395,21 +336,7 @@ export async function assessResearch(request: ContentRequest): Promise<{
   return { ok: true, usable, failed };
 }
 
-/**
- * Whether there is enough MATERIAL to write from, judged after indexing.
- *
- * `assessResearch` runs on fetch status, before anything has been chunked, so
- * a page that fetched cleanly still counts even if it turns out to hold
- * nothing usable. That is how a run reached planning with one real article and
- * a GitLab sign-in page behind it: two "sources" by status, one source in
- * substance, and every downstream step then failed on material that was never
- * there.
- *
- * The honest place to stop is here — before spending on planning, drafting and
- * evaluation — with a reason a person can act on. §7.3: "If fewer than two
- * fetch successfully and the request had no seed URLs, it stops. One source is
- * not research."
- */
+
 export async function assessMaterial(request: ContentRequest): Promise<{
   ok: boolean;
   sourcesWithContent: number;
@@ -423,15 +350,7 @@ export async function assessMaterial(request: ContentRequest): Promise<{
     .select("id, source_id")
     .eq("request_id", request.id);
 
-  /**
-   * Sources that were read but could not be indexed.
-   *
-   * This is the case that hid for a whole run: six articles of 20k–36k
-   * characters fetched perfectly, the embedding provider rate-limited every
-   * batch, and the only visible symptom three steps later was "the angles are
-   * too similar". Naming the real cause here is the difference between a
-   * five-minute fix and an afternoon.
-   */
+
   const { data: failedRows } = await db
     .from(table("sources"))
     .select("id, embed_retryable")
@@ -440,7 +359,6 @@ export async function assessMaterial(request: ContentRequest): Promise<{
 
   const failed = (failedRows ?? []) as Pick<Source, "id" | "embed_retryable">[];
   const embedFailed = failed.length;
-  // Still queued for another automatic attempt, as opposed to given up on.
   const embedPending = failed.filter((s) => s.embed_retryable).length;
   const rows = excerptRows ?? [];
   const bySource = new Map<string, number>();
@@ -448,10 +366,6 @@ export async function assessMaterial(request: ContentRequest): Promise<{
     const id = row.source_id as string;
     bySource.set(id, (bySource.get(id) ?? 0) + 1);
   }
-
-  // A source contributing a single chunk is a stub, not a reference. Counting
-  // it inflates "how much did we find" and is what made the numbers look fine
-  // while the corpus was empty.
   const substantial = [...bySource.values()].filter((count) => count >= 2).length;
   const hadSeeds = (request.seed_urls ?? []).length > 0;
 
@@ -478,8 +392,6 @@ export async function assessMaterial(request: ContentRequest): Promise<{
   }
 
   if (substantial < MIN_SOURCES_FOR_RESEARCH && !hadSeeds) {
-    // When indexing is what starved it, say THAT. "Add a source URL" is
-    // useless advice if the pages were found and simply could not be indexed.
     if (embedFailed > 0) {
       const plural = embedFailed === 1 ? "" : "s";
       const were = embedFailed === 1 ? "was" : "were";
@@ -514,8 +426,6 @@ export async function assessMaterial(request: ContentRequest): Promise<{
   return { ok: true, sourcesWithContent: substantial, excerpts: rows.length };
 }
 
-// ─── Step: chunk_embed (§7.4) ───────────────────────────────────────────────
-
 export interface ChunkEmbedResult {
   sourcesProcessed: number;
   excerptsCreated: number;
@@ -523,28 +433,13 @@ export interface ChunkEmbedResult {
   complete: boolean;
 }
 
-/** The fields the pending decision actually turns on. */
+
 export type EmbedCandidate = Pick<
   Source,
   "id" | "embed_failed" | "embed_retryable" | "embed_attempts"
 >;
 
-/**
- * Which sources still need indexing, in the order to attempt them.
- *
- * A source is pending when it has no excerpts AND we have not given up on it.
- * Giving up means one of two things: the failure was permanent (no chunks to
- * embed — retrying cannot change that), or it was transient but has already
- * used its attempts. Anything else comes back around, because the common
- * transient failure here is a per-minute rate limit that clears on its own.
- *
- * Ordering matters as much as the filter. Sources that have never been tried
- * go first, so one article stuck retrying cannot hold up five that would
- * succeed immediately.
- *
- * Pure and exported so the rule can be tested directly: when this was inline
- * it excluded every failed source forever, and nothing caught it.
- */
+
 export function selectPendingSources<T extends EmbedCandidate>(
   candidates: T[],
   indexed: Set<string>,
@@ -558,19 +453,17 @@ export function selectPendingSources<T extends EmbedCandidate>(
     .sort((a, b) => a.embed_attempts - b.embed_attempts);
 }
 
-/**
- * Chunks and embeds one source per invocation, so a long page cannot blow the
- * function budget. Resumable: a source that already has excerpts is skipped.
- */
+
 export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbedResult> {
   const db = serviceClient();
 
-  const { data: sources } = await db
+  const { data: sources, error: sourcesError } = await db
     .from(table("sources"))
     .select("id, markdown, fetch_status, embed_failed, embed_retryable, embed_attempts, title")
     .eq("request_id", request.id)
     .in("fetch_status", ["ok", "too_large", "redirected_offsite"]);
 
+  if (sourcesError) throw new Error(sourcesError.message);
   const candidates = (sources ?? []) as Pick<
     Source,
     | "id"
@@ -582,12 +475,15 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
     | "title"
   >[];
 
-  const { data: existing } = await db
+  const { data: existing, error: existingError } = await db
     .from(table("excerpts"))
     .select("source_id")
     .eq("request_id", request.id);
 
-  const done = new Set((existing ?? []).map((r) => r.source_id as string));
+  if (existingError) throw new Error(existingError.message);
+  const counts = new Map<string, number>();
+  for (const row of existing ?? []) counts.set(row.source_id, (counts.get(row.source_id) ?? 0) + 1);
+  const done = new Set(candidates.filter(source => counts.get(source.id) === chunkMarkdown(source.markdown ?? "").length && counts.has(source.id)).map(s => s.id));
 
   const pending = selectPendingSources(candidates, done);
 
@@ -599,13 +495,12 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
   const attempt = source.embed_attempts + 1;
   let created = 0;
   let embedFailures = 0;
-  /** Set when this source failed in a way that brings it back around. */
+
   let willRetry = false;
 
   const chunks = chunkMarkdown(source.markdown ?? "");
 
   if (chunks.length === 0) {
-    // Permanent: the text is not going to appear on a later attempt.
     await db
       .from(table("sources"))
       .update({
@@ -618,8 +513,6 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
     embedFailures++;
   } else {
     try {
-      // Embedded as DOCUMENTS. The input type is not interchangeable with the
-      // query type used for sentences and the request vector.
       const { embeddings } = await embed(
         chunks.map((c) => c.text),
         "document",
@@ -638,15 +531,15 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
         embedding: embeddings[i] ? toVectorLiteral(embeddings[i]!) : null,
       }));
 
-      for (let i = 0; i < rows.length; i += EMBEDDING_BATCH_SIZE) {
-        const { error } = await db.from(table("excerpts")).insert(rows.slice(i, i + EMBEDDING_BATCH_SIZE));
-        if (error && !error.message.includes("duplicate")) throw new Error(error.message);
+      // One insert is transactional: no partially indexed source can look done.
+      if (counts.has(source.id)) {
+        const { error } = await db.from(table("excerpts")).delete().eq("source_id",source.id);
+        if (error) throw new Error(error.message);
       }
+      const { error: insertError } = await db.from(table("excerpts")).insert(rows);
+      if (insertError) throw new Error(insertError.message);
 
       created = rows.length;
-
-      // A source that failed earlier and has now succeeded must lose the flag,
-      // or gate one keeps showing a failure note for a source that is indexed.
       if (source.embed_failed) {
         await db
           .from(table("sources"))
@@ -659,12 +552,8 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
           .eq("id", source.id);
       }
     } catch (err) {
-      // §7.4: a source whose chunks could not be embedded is MARKED and
-      // excluded from vector selection, but remains available for manual
-      // inclusion with a visible note. It is never silently dropped.
-      //
-      // Whether it is also RETRIED turns on the provider's own answer: a 429 or
-      // a 5xx is a statement about this minute, not about this page.
+      if (err instanceof BudgetExceededError) throw err;
+      if (!(err instanceof EmbeddingError)) throw err;
       embedFailures++;
 
       const retryable = err instanceof EmbeddingError && err.retryable;
@@ -692,18 +581,11 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
           detail: { error: String(err), attempt, retryable },
         },
       );
+      if (willRetry) throw err;
     }
   }
 
-  /**
-   * This source counts as finished only if it will not come back around. A
-   * retryable failure leaves it pending, so reporting `complete` here would
-   * move the pipeline on with the source still unindexed — the exact bug this
-   * change exists to fix, one level up.
-   *
-   * The attempt cap is what guarantees this terminates: every pass either
-   * indexes a source or increments its attempt count toward MAX_EMBED_ATTEMPTS.
-   */
+
   const remaining = pending.length - (willRetry ? 0 : 1);
   return {
     sourcesProcessed: 1,
@@ -713,13 +595,7 @@ export async function stepChunkEmbed(request: ContentRequest): Promise<ChunkEmbe
   };
 }
 
-// ─── Step: score (§7.5) ─────────────────────────────────────────────────────
 
-/**
- * relevance_score per source = the maximum cosine similarity between any of
- * its excerpts and the embedded request. Sources below the threshold are shown
- * collapsed and unchecked, with the score visible. Nothing is auto-deleted.
- */
 export async function stepScore(request: ContentRequest): Promise<{ scored: number }> {
   const db = serviceClient();
 
@@ -751,20 +627,7 @@ export async function stepScore(request: ContentRequest): Promise<{ scored: numb
   return { scored: count ?? 0 };
 }
 
-/** Rough pre-flight estimate shown before research begins (§6). */
-export function estimateRequestCost(seedUrlCount: number, channelCount: number): number {
-  const searchCents = seedUrlCount === 0 ? 4 : 0;
-  const scrapeCents = Math.max(seedUrlCount, 6) * 0.1;
-  const embedCents = 0.1;
-  const planCents = 1;
-  const draftCents = 5;
-  const evalCents = 3.5;
-  const reviseCents = 3;
-  const adaptCents = channelCount * 0.35;
 
-  return Math.ceil(
-    searchCents + scrapeCents + embedCents + planCents + draftCents + evalCents + reviseCents + adaptCents,
-  );
-}
+export { estimateRequestCost } from "@/lib/intake";
 
 export { estimateTokens };

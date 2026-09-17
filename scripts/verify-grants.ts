@@ -19,9 +19,10 @@ import { config } from "dotenv";
 config({ quiet: true });
 
 import pg from "pg";
+import { readdirSync, readFileSync } from "node:fs";
 
 /** The only functions a signed-in person may call directly. Both are reads. */
-const AUTHENTICATED_ALLOWED = new Set(["read_counter", "dashboard_counts"]);
+const AUTHENTICATED_ALLOWED = new Set<string>();
 
 /**
  * Called BY the RLS policies in 0002, evaluated as the querying role, so that
@@ -50,6 +51,7 @@ export async function checkGrants(): Promise<GrantCheckResult> {
   });
 
   await client.connect();
+  const publicNames = [...new Set(readdirSync("supabase/migrations").filter(f => f.endsWith(".sql")).flatMap(f => [...readFileSync("supabase/migrations/" + f, "utf8").matchAll(/create(?: or replace)? function public\.(\w+)/gi)].map(m => m[1]!)))];
 
   /**
    * Only the functions THIS BUILD created.
@@ -81,7 +83,7 @@ export async function checkGrants(): Promise<GrantCheckResult> {
           from (select (aclexplode(p.proacl)).*) as x
          where (x).privilege_type = 'EXECUTE'
       ) a on true
-     where n.nspname in ('public', 'content_agent')
+     where (n.nspname = 'content_agent' or (n.nspname='public' and p.proname=any($1)))
        and p.prokind = 'f'
        -- A null ACL means the DEFAULT applies, which is EXECUTE to PUBLIC.
        and (p.proacl is null or a.grantee is not null)
@@ -92,7 +94,7 @@ export async function checkGrants(): Promise<GrantCheckResult> {
             and d.deptype = 'e'
        )
      order by 1, 2, 3
-  `);
+  `, [publicNames]);
 
   const problems: string[] = [];
 

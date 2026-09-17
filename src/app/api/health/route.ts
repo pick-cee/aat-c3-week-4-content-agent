@@ -1,7 +1,6 @@
 import { NextResponse } from "next/server";
-import { serviceClient, table } from "@/lib/db/client";
+import { serviceClient, table, currentProfile } from "@/lib/db/client";
 import { integrationStatus } from "@/lib/env";
-import { runMigrations } from "@/lib/db/migrate";
 import { PRICES_VERIFIED_ON } from "@/lib/constants";
 
 /**
@@ -38,10 +37,10 @@ export async function GET() {
   });
 
   checks.schema = await timed(async () => {
-    const result = await runMigrations();
-    return result.alreadyCurrent
-      ? `Up to date (${result.skipped.length} migrations applied previously).`
-      : `Applied ${result.applied.length} migration(s) on this call.`;
+    const { error } = await serviceClient().from(table("content_requests"))
+      .select("retry_after, reserved_cost_cents, revision_parent_id, untracked_cost", { head: true }).limit(1);
+    if (error) throw new Error("Apply the pending database migrations with npm run db:push.");
+    return "Execution schema is present.";
   });
 
   const integrations = integrationStatus();
@@ -78,22 +77,24 @@ export async function GET() {
       : `${connected} of ${rows.length} channels connected.`;
   });
 
-  const anyDown = Object.values(checks).some((c) => c.state === "down");
+  const anyDown = Object.values(checks).some((c) => c.state === "down") ||
+    ["anthropic", "firecrawl", "embeddings"].some(name => checks[name]?.state !== "ok");
+  const profile = await currentProfile().catch(() => null);
 
   return NextResponse.json(
     {
       status: anyDown ? "degraded" : "ok",
-      checks,
-      config: {
+      checks: profile ? checks : Object.fromEntries(Object.entries(checks).map(([name, check]) => [name, { state: check.state }])),
+      ...(profile ? { config: {
         demoMode: integrations.demoMode,
         pricesVerifiedOn: PRICES_VERIFIED_ON,
-      },
+      } } : {}),
       checkedAt: new Date().toISOString(),
     },
     {
       // Degraded is still a working response: the point is to be readable, not
       // to make a monitoring tool page someone at 3am for a missing API key.
-      status: 200,
+      status: anyDown ? 503 : 200,
       headers: { "cache-control": "no-store" },
     },
   );

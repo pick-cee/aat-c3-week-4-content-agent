@@ -155,6 +155,14 @@ export interface BrandVoice {
   created_at: string;
 }
 
+export interface ChannelRevision {
+  id: string;
+  outputId: string;
+  articleVersionId: string;
+  channel: ChannelName;
+  note: string;
+}
+
 export interface ContentRequest {
   id: string;
   created_by: string;
@@ -188,6 +196,7 @@ export interface ContentRequest {
   cost_complete: boolean;
   revision_rounds: number;
   revision_parent_id?: string | null;
+  channel_revision?: ChannelRevision | null;
   replans: number;
   submit_token: string | null;
   publish_target: string | null;
@@ -412,6 +421,9 @@ export interface FormatCheckResult {
 }
 
 export interface ChannelOutput {
+  revision_job_id?: string | null;
+  parent_output_id?: string | null;
+  revision_note?: string | null;
   id: string;
   request_id: string;
   article_version_id: string;
@@ -618,6 +630,9 @@ export interface Database {
       };
     };
     Functions: {
+      request_channel_revision: { Args: { p_request_id: string; p_output_id: string; p_actor_id: string; p_note: string }; Returns: string };
+      save_channel_revision: { Args: { p_request_id: string; p_job_id: string; p_lease_id: string | null; p_output: Record<string, unknown> }; Returns: ChannelOutput[] };
+      settle_content_request: { Args: { p_request_id: string }; Returns: string | null };
       consume_rate_limit: { Args: { p_scope: string; p_scope_key: string; p_window: string; p_metric: string; p_limit: number }; Returns: { allowed: boolean; current: number } };
       choose_content_image: { Args: { p_request_id: string; p_image_id: string | null; p_alt: string | null }; Returns: boolean };
       reserve_model_call: { Args: { p_id: string; p_request_id: string; p_step: string; p_model: string; p_ceiling: number; p_monthly_limit: number; p_lease_id: string | null }; Returns: { allowed: boolean; spent?: number; budget?: number; scope?: string } };

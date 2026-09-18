@@ -126,6 +126,19 @@ export async function requestRevision(requestId: string, note: string): Promise<
   return reviewArticle(requestId, "revision_requested", note);
 }
 
+export async function requestChannelRevision(requestId: string, outputId: string, note: string): Promise<ActionResult> {
+  const profile = await currentProfile();
+  if (!profile || !canApprove(profile)) return { ok: false, error: "A reviewer or admin must request this revision." };
+  if (!note.trim() || note.trim().length > 2000) return { ok: false, error: "Describe the change in 1 to 2,000 characters." };
+  const { error } = await serviceClient().rpc("request_channel_revision", {
+    p_request_id: requestId, p_output_id: outputId, p_actor_id: profile.id, p_note: note.trim(),
+  });
+  if (error) return { ok: false, error: error.message };
+  kickoffPipeline(requestId);
+  revalidatePath("/requests/" + requestId); revalidatePath("/queue"); revalidatePath("/");
+  return { ok: true };
+}
+
 export async function acceptDespiteChecks(requestId: string, note: string): Promise<ActionResult> {
   return reviewArticle(requestId, "approved", note);
 }

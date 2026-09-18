@@ -605,49 +605,9 @@ async function setStatus(
  * a success the system never received (rule 9), so it becomes `cancelled`.
  */
 export async function settleRequestIfDone(requestId: string): Promise<void> {
-  const db = serviceClient();
-
-  const { data: rows, error } = await db
-    .from(table("publish_queue"))
-    .select("status")
-    .eq("request_id", requestId);
-
-  if (error || !rows || rows.length === 0) return;
-
-  const statuses = rows.map((r) => r.status as PublishStatus);
-
-  // Anything still in motion, or waiting on a person, is not settled.
-  const pending = statuses.some((s) =>
-    ["queued", "held", "publishing", "awaiting_manual_post", "uncertain", "blocked_not_connected"]
-      .includes(s),
-  );
-  if (pending) return;
-
-  const anyDelivered = statuses.some((s) =>
-    ["published", "published_dry_run", "posted_manually", "partially_delivered"].includes(s),
-  );
-
-  const next = anyDelivered ? "published" : "cancelled";
-
-  const { data: current } = await db
-    .from(table("content_requests"))
-    .select("status")
-    .eq("id", requestId)
-    .maybeSingle();
-
-  // Only advance from `scheduled`/`publishing`: a request a person cancelled
-  // or that failed earlier keeps the state that explains why.
-  if (!current || !["scheduled", "publishing"].includes(current.status as string)) return;
-
-  await db
-    .from(table("content_requests"))
-    .update({ status: next, current_step: null })
-    .eq("id", requestId);
-
-  await logInfo(
-    next === "published"
-      ? "Every channel is resolved and at least one went out, so the request is published."
-      : "Every channel was cancelled or rejected, so nothing went out.",
-    { requestId },
-  );
+  const { data, error } = await serviceClient().rpc("settle_content_request", { p_request_id: requestId });
+  if (error) throw new Error("Could not settle request: " + error.message);
+  if (data) await logInfo(data === "published"
+    ? "Every channel is resolved and at least one went out, so the request is published."
+    : "Every channel was cancelled or rejected, so nothing went out.", { requestId });
 }

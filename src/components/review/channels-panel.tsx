@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { approveChannel, approveChannels, rejectChannel } from "@/app/actions/approvals";
+import { approveChannel, approveChannels, rejectChannel, requestChannelRevision } from "@/app/actions/approvals";
 import { CHANNEL_LABELS, formatWhen } from "../status";
 import { useAction } from "./use-action";
 import { CopyButton } from "./copy-button";
@@ -28,6 +28,7 @@ export function ChannelsPanel({
   publishTarget,
   canApprove,
   locked,
+  canRevise = false,
 }: {
   requestId: string;
   outputs: ChannelOutput[];
@@ -38,6 +39,7 @@ export function ChannelsPanel({
   publishTarget: string | null;
   canApprove: boolean;
   locked: boolean;
+  canRevise?: boolean;
 }) {
   const action = useAction();
   const { pending } = action;
@@ -98,6 +100,7 @@ export function ChannelsPanel({
           publishTarget={publishTarget}
           canApprove={canApprove}
           readOnly={readOnly}
+          canRevise={canRevise && canApprove}
         />
       ))}
     </div>
@@ -130,6 +133,7 @@ function ChannelCard({
   publishTarget,
   canApprove,
   readOnly,
+  canRevise,
 }: {
   requestId: string;
   output: ChannelOutput;
@@ -137,6 +141,7 @@ function ChannelCard({
   publishTarget: string | null;
   canApprove: boolean;
   readOnly: boolean;
+  canRevise: boolean;
 }) {
   // Its own action state: approving LinkedIn used to put a spinner on the
   // newsletter's button too, because `pending` came from the shared parent.
@@ -146,6 +151,8 @@ function ChannelCard({
   const [note, setNote] = useState("");
   const [when, setWhen] = useState("");
   const [showReject, setShowReject] = useState(false);
+  const [showRevision, setShowRevision] = useState(false);
+  const [revisionNote, setRevisionNote] = useState("");
 
   const isHandoff = output.channel === "linkedin" || output.channel === "x";
   const failures = (output.format_check?.checks ?? []).filter((c) => !c.passed);
@@ -232,6 +239,28 @@ function ChannelCard({
         <div className="tiny muted mb-1">
           This is generated and scheduled here, then sent to whoever posts it. It shows as
           awaiting posting, never as published, until they confirm with a URL.
+        </div>
+      )}
+
+      {output.revision_note && <p className="tiny muted">Revision note: {output.revision_note}</p>}
+      {canRevise && (
+        <div className="mt-2">
+          {showRevision ? <div className="stack" style={{ gap: 8 }}>
+            <label htmlFor={`revise-${output.id}`}>What should change in {CHANNEL_LABELS[output.channel]}?</label>
+            <textarea id={`revise-${output.id}`} rows={3} maxLength={2000} value={revisionNote}
+              onChange={e => setRevisionNote(e.target.value)} disabled={pending}
+              placeholder={output.channel === "newsletter" ? "Rewrite the opening to be more direct and add a friendly sign-off. Keep the other sections." : "Shorten the opening and make the call to action clearer. Keep the facts from the article."} />
+            <p className="tiny muted mb-0">Uses the current article as its source. Only this channel gets a new version, and it needs fresh approval. Any pending send for this channel is withdrawn. Copies already sent stay unchanged.</p>
+            <div className="btn-row">
+              <button className="btn btn-primary btn-sm" disabled={pending || !revisionNote.trim()}
+                onClick={() => action.run(async () => {
+                  const result = await requestChannelRevision(requestId, output.id, revisionNote);
+                  if (result.ok) { setShowRevision(false); setRevisionNote(""); }
+                  return result;
+                })}>{pending ? "Requesting revision..." : "Revise this channel"}</button>
+              <button className="btn btn-sm btn-ghost" disabled={pending} onClick={() => setShowRevision(false)}>Cancel</button>
+            </div>
+          </div> : <button className="btn btn-sm" disabled={pending} onClick={() => setShowRevision(true)}>Revise {CHANNEL_LABELS[output.channel]}</button>}
         </div>
       )}
 

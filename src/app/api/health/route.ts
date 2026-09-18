@@ -38,7 +38,7 @@ export async function GET() {
 
   checks.schema = await timed(async () => {
     const { error } = await serviceClient().from(table("content_requests"))
-      .select("retry_after, reserved_cost_cents, revision_parent_id, untracked_cost", { head: true }).limit(1);
+      .select("retry_after, reserved_cost_cents, revision_parent_id, untracked_cost, channel_revision", { head: true }).limit(1);
     if (error) throw new Error("Apply the pending database migrations with npm run db:push.");
     return "Execution schema is present.";
   });

@@ -1,6 +1,7 @@
 import "server-only";
 import { PermanentPipelineError } from "./errors";
-import { assertExecutionActive } from "./execution";
+import { assertExecutionActive, executionLeaseId } from "./execution";
+import { channelRevisionPrompt, channelRevisionSourceIssues } from "./channel-revision";
 import { serviceClient, table } from "@/lib/db/client";
 import { logInfo, logWarn } from "@/lib/log";
 import { callStructured, recordDiscarded } from "@/lib/providers/anthropic";
@@ -97,11 +98,12 @@ export async function adaptChannel(
   voice: BrandVoice | null,
   channel: ChannelName,
   articleUrl: string | null,
+  revision?: { id: string; previous: ChannelOutput; note: string },
 ): Promise<AdaptResult> {
   const context = {
     requestId: request.id,
     step: "adapt",
-    purpose: `adapt for ${channel}`,
+    purpose: revision ? `revise ${channel}` : `adapt for ${channel}`,
   };
 
   const claimMap = (version.claim_map ?? []) as ClaimMapEntry[];
@@ -125,7 +127,11 @@ export async function adaptChannel(
     { text: PUNCTUATION_BLOCK, cache: true },
   ];
 
-  const basePrompt = buildAdaptPrompt(request, version, channel, includeLink ? articleUrl : null);
+  if (revision && (revision.previous.article_version_id !== version.id || revision.previous.channel !== channel)) {
+    throw new PermanentPipelineError("The channel revision does not match this article and platform.");
+  }
+  const basePrompt = buildAdaptPrompt(request, version, channel, includeLink ? articleUrl : null) +
+    (revision ? "\n\n" + channelRevisionPrompt(revision.previous, revision.note) : "");
 
   let attempt = 0;
   let retryNote = "";
@@ -144,21 +150,22 @@ export async function adaptChannel(
     });
 
     const inherited = checkInheritedMarkers(result.value.body, claimMap);
-    if (!inherited.valid) {
+    const sourceIssues = revision ? channelRevisionSourceIssues([result.value.subject, result.value.body].filter(Boolean).join("\n"), version, includeLink ? articleUrl : null) : [];
+    if (!inherited.valid || sourceIssues.length) {
       await recordDiscarded(
         context,
         MODELS.adaptation,
         result.usage,
-        `Cited ${inherited.unknownLabels.join(", ")}, which the article does not.`,
+        [...(inherited.valid ? [] : [`Cited ${inherited.unknownLabels.join(", ")}, which the article does not.`]), ...sourceIssues].join(" "),
       result.callId,
       );
       retryNote =
         `── YOUR PREVIOUS ATTEMPT WAS DISCARDED ──\n` +
         `You cited ${inherited.unknownLabels.join(", ")}, which do not appear in the article. ` +
-        `Use only markers that are already in the article text.`;
+        `Use only markers that are already in the article text. ${sourceIssues.join(" ")} Use only facts and links in the article.`;
       attempt++;
       if (attempt > CHANNEL_FORMAT_RETRIES) {
-        throw new PermanentPipelineError("The channel repeatedly cited sources absent from the article. Its output was not saved.");
+        throw new PermanentPipelineError("The channel repeatedly cited sources absent from the article or introduced unsupported figures or links. Its output was not saved.");
       }
       continue;
     }
@@ -170,6 +177,7 @@ export async function adaptChannel(
 
     if (check.passed) {
       const output = await saveOutput({
+        revisionId: revision?.id,
         request,
         version,
         channel,
@@ -206,6 +214,7 @@ export async function adaptChannel(
 
     if (recheck.passed) {
       const output = await saveOutput({
+        revisionId: revision?.id,
         request,
         version,
         channel,
@@ -228,6 +237,7 @@ export async function adaptChannel(
   }
   const output = lastOutput
     ? await saveOutput({
+        revisionId: revision?.id,
         request,
         version,
         channel,
@@ -336,6 +346,7 @@ function channelLabel(channel: ChannelName): string {
 }
 
 interface SaveOutputInput {
+  revisionId?: string;
   request: ContentRequest;
   version: ArticleVersion;
   channel: ChannelName;
@@ -373,9 +384,7 @@ async function saveOutput(input: SaveOutputInput): Promise<ChannelOutput> {
 
   const nextVersion = ((latest?.version as number | undefined) ?? 0) + 1;
 
-  const { data, error } = await db
-    .from(table("channel_outputs"))
-    .insert({
+  const payload = {
       request_id: request.id,
       article_version_id: version.id,
       channel,
@@ -394,9 +403,11 @@ async function saveOutput(input: SaveOutputInput): Promise<ChannelOutput> {
       model_used: MODELS.adaptation,
       input_tokens: input.usage.inputTokens,
       output_tokens: input.usage.outputTokens,
-    })
-    .select()
-    .single();
+    };
+  const { data, error } = input.revisionId
+    ? await db.rpc("save_channel_revision", { p_request_id: request.id, p_job_id: input.revisionId,
+        p_lease_id: executionLeaseId() ?? null, p_output: payload }).single()
+    : await db.from(table("channel_outputs")).insert(payload).select().single();
 
   if (error || !data) {
     throw new Error(`Could not save the ${channel} output: ${error?.message ?? "no row"}`);

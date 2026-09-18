@@ -15,7 +15,7 @@ async function nextRequest() {
   if (!createdAfter) return undefined;
   const now = new Date().toISOString();
   const { data, error } = await serviceClient().from(table("content_requests")).select("id")
-    .gte("created_at", createdAfter).is("deleted_at", null)
+    .or(`created_at.gte.${createdAfter},channel_revision.not.is.null`).is("deleted_at", null)
     .in("status", ["researching", "drafting", "evaluating", "revising", "adapting"])
     .or("runner_lease_until.is.null,runner_lease_until.lt." + now)
     .or("retry_after.is.null,retry_after.lte." + now)

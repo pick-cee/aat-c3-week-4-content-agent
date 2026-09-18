@@ -116,7 +116,7 @@ export default async function RequestPage({
       <Stepper request={request} />
       {latest && <div className="row mb-2" style={{ justifyContent: "flex-end" }}><ArticleExport title={latest.title} body={latest.body_md} sources={((sources.data ?? []) as unknown as Source[]).filter(source=>source.included)} /></div>}
       {isRunning && <RunnerPoll requestId={request.id} status={request.status} step={request.current_step} startedAt={request.step_started_at} />}
-      {latest && (isRunning || ["failed", "budget_exceeded"].includes(request.status)) && <section className="card mb-3"><div className="card-head"><h2>Your article</h2><span className="pill pill-info">Draft awaiting approval</span></div><div className="card-pad"><ArticleView bodyMd={latest.body_md} claimMap={latest.claim_map} excerpts={buildExcerptLookup(reviewSources, reviewExcerpts)} sources={reviewSources} /></div></section>}
+      {latest && !request.channel_revision && (isRunning || ["failed", "budget_exceeded"].includes(request.status)) && <section className="card mb-3"><div className="card-head"><h2>Your article</h2><span className="pill pill-info">Draft awaiting approval</span></div><div className="card-pad"><ArticleView bodyMd={latest.body_md} claimMap={latest.claim_map} excerpts={buildExcerptLookup(reviewSources, reviewExcerpts)} sources={reviewSources} /></div></section>}
 
       {["failed", "budget_exceeded", "needs_human"].includes(request.status) && (
         <FailurePanel request={request} canApprove={canApprove(profile)} />
@@ -133,9 +133,9 @@ export default async function RequestPage({
       {/* `needs_human` after two revisions means a finished draft is waiting on
           a judgement call, so the reviewer must be able to READ it. Without
           this the screen offered "Cancel this request" and nothing else. */}
-      {["content_review", "scheduled", "publishing", "published", "needs_human"].includes(
+      {(["content_review", "scheduled", "publishing", "published", "needs_human"].includes(
         request.status,
-      ) &&
+      ) || Boolean(request.channel_revision)) &&
         latest && (
           <GateTwo
             request={request}

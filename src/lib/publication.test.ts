@@ -2,6 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 vi.mock("./db/client",()=>({serviceClient:vi.fn(),table:(s:string)=>s}));
 import { mayShowPublicArticle } from "./publication";
 describe("public article visibility",()=>{
+  it("keeps an already approved article available during a channel-only revision", () => {
+    expect(mayShowPublicArticle("adapting", null, true, true)).toBe(true);
+    expect(mayShowPublicArticle("adapting", null, false, true)).toBe(false);
+    expect(mayShowPublicArticle("adapting", null, true, false)).toBe(false);
+    expect(mayShowPublicArticle("cancelled", null, true, true)).toBe(false);
+  });
   it.each(["draft","researching","drafting","evaluating","content_review","needs_human","failed","cancelled"])("keeps %s articles private",status=>{
     expect(mayShowPublicArticle(status,null,true)).toBe(false);
   });

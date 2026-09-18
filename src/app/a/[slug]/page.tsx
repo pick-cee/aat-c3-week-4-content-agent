@@ -27,18 +27,16 @@ import type { ClaimMapEntry, FetchStatus, Source } from "@/lib/db/types";
 
 export const dynamic = "force-dynamic";
 
-const PUBLISHABLE = ["scheduled", "publishing", "published"];
-
 const loadArticle = cache(async (slug: string) => {
   const db = serviceClient();
 
   const { data: request } = await db
     .from(table("content_requests"))
-    .select("id, slug, status, updated_at, deleted_at")
+    .select("id, slug, status, updated_at, deleted_at, channel_revision")
     .eq("slug", slug)
     .maybeSingle();
 
-  if (!request || request.deleted_at || !PUBLISHABLE.includes(request.status as string)) return null;
+  if (!request || request.deleted_at) return null;
 
   const { data: version } = await db
     .from(table("article_versions"))
@@ -50,7 +48,7 @@ const loadArticle = cache(async (slug: string) => {
     .limit(1)
     .maybeSingle();
 
-  if (!version || !mayShowPublicArticle(request.status as string, request.deleted_at as string | null, await hasPublicApproval(request.id as string, version.id as string))) return null;
+  if (!version || !mayShowPublicArticle(request.status as string, request.deleted_at as string | null, await hasPublicApproval(request.id as string, version.id as string), Boolean(request.channel_revision))) return null;
 
   const { data: sources } = await db
     .from(table("sources"))

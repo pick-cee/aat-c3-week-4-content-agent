@@ -1,7 +1,8 @@
 import { serviceClient, table } from "./db/client";
 
-export function mayShowPublicArticle(status: string, deletedAt: string | null, approved: boolean): boolean {
-  return !deletedAt && approved && ["scheduled", "publishing", "published"].includes(status);
+export function mayShowPublicArticle(status: string, deletedAt: string | null, approved: boolean, channelRevision = false): boolean {
+  return !deletedAt && approved && (["scheduled", "publishing", "published"].includes(status) ||
+    (channelRevision && ["adapting", "failed", "budget_exceeded"].includes(status)));
 }
 
 /** Only the exact article version attached to a human-approved channel is public. */

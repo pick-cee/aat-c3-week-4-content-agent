@@ -503,6 +503,20 @@ async function advanceRevising(request: ContentRequest): Promise<Advance> {
 async function advanceAdapting(request: ContentRequest): Promise<Advance> {
   const { voice, version } = await loadContext(request);
   if (!version) throw new PermanentPipelineError("There is no article to adapt.");
+  if (request.channel_revision) {
+    const revision = request.channel_revision;
+    if (version.id !== revision.articleVersionId) throw new PermanentPipelineError("The article changed. Review the latest draft before revising this channel.");
+    const { data: previous, error: previousError } = await serviceClient().from(table("channel_outputs"))
+      .select("*").eq("id", revision.outputId).eq("request_id", request.id).single();
+    if (previousError || !previous) throw new PermanentPipelineError("The saved channel version could not be loaded.");
+    await adaptChannel(request, version, voice, revision.channel, request.slug ? env.app.url + "/a/" + request.slug : null,
+      { id: revision.id, previous, note: revision.note });
+    // The save RPC commits both the unapproved output and the completion state.
+    const { data: completed, error: completedError } = await serviceClient().from(table("content_requests"))
+      .select("status").eq("id", request.id).single();
+    if (completedError) throw new Error(completedError.message);
+    return { to: completed.status, step: "adapt", message: "The revised channel is ready for your approval.", more: false };
+  }
   const { data, error } = await serviceClient().from(table("channel_outputs"))
     .select("channel, status").eq("article_version_id", version.id);
   if (error) throw new Error(error.message);

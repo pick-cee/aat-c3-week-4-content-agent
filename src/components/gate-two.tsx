@@ -122,11 +122,14 @@ export function GateTwo({
    * channel below.
    */
   const articleLocked = isArticleLocked(request.status);
-  const channelsLocked = areChannelsLocked(request.status);
+  const channelsLocked = areChannelsLocked(request.status) || Boolean(request.channel_revision);
 
   return (
     <>
       {article.error && <div className="alert alert-error">{article.error}</div>}
+      {request.channel_revision && <div className="alert alert-info">{request.status === "adapting"
+        ? `Revising ${request.channel_revision.channel === "newsletter" ? "Newsletter" : request.channel_revision.channel === "linkedin" ? "LinkedIn" : "X"} against this article. The new version will need approval.`
+        : "This channel revision is paused. The previous copy is saved below; resolve the issue above to continue."}</div>}
 
       {/* What needs a decision, before anything else on the screen.
           A reviewer should not have to read two panes and count pills to work
@@ -139,7 +142,7 @@ export function GateTwo({
         onOpenChannels={() => setTab("channels")}
       />
 
-      {channelsLocked && (
+      {channelsLocked && !request.channel_revision && (
         <div className="alert alert-info">
           This request is {request.status.replace("_", " ")}. The content below is what was
           approved.
@@ -263,6 +266,7 @@ export function GateTwo({
                 publishTarget={request.publish_target}
                 canApprove={canApprove}
                 locked={channelsLocked}
+                canRevise={!request.channel_revision && ["content_review", "scheduled", "published"].includes(request.status)}
               />
             )}
 

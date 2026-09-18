@@ -12,7 +12,7 @@ import type { ActivityLogEntry } from "@/lib/db/types";
  * is behind a disclosure.
  */
 
-export function ActivityFeed({ entries }: { entries: ActivityLogEntry[] }) {
+export function ActivityFeed({ entries, revisionNotes = {} }: { entries: ActivityLogEntry[]; revisionNotes?: Record<string, string> }) {
   if (entries.length === 0) return null;
 
   // Entries arrive newest first (the query orders by created_at desc).
@@ -66,6 +66,11 @@ export function ActivityFeed({ entries }: { entries: ActivityLogEntry[] }) {
             />
             <div className="grow" style={{ minWidth: 0 }}>
               <div className="small">{entry.message}</div>
+              {revisionNotes[entry.id] && (
+                <p className="small muted mt-1" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                  Revision note: {revisionNotes[entry.id]}
+                </p>
+              )}
               {entry.detail && (
                 <details>
                   <summary className="tiny dim" style={{ cursor: "pointer" }}>

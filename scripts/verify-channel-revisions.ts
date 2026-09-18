@@ -22,6 +22,8 @@ async function main() {
     await db.query("set local lock_timeout='5s'");
     await db.query("set local statement_timeout='30s'");
     await db.query(readFileSync("supabase/migrations/0031_channel_revisions.sql", "utf8"));
+    const activityMigration = readFileSync("supabase/migrations/0032_channel_revision_activity.sql", "utf8");
+    await db.query(activityMigration);
     const actor = (await db.query("select id from content_agent.profiles where role in ('reviewer','admin') limit 1")).rows[0].id;
     const req = randomUUID(), article = randomUUID(), newsletter = randomUUID(), linkedin = randomUUID();
     await db.query("insert into content_agent.content_requests(id,created_by,idea,target_audience,channels,status,budget_cents,hold_in_queue) values($1,$2,'Revision verification','Test',ARRAY['newsletter','linkedin']::content_agent.channel_name[],'content_review',150,true)", [req, actor]);
@@ -37,6 +39,8 @@ async function main() {
     await reject("select public.request_channel_revision($1,$2,$3,$4)", args, "An in-flight send cannot be replaced");
     await db.query("update content_agent.publish_queue set status='held' where channel_output_id=$1", [newsletter]);
     const job = (await db.query("select public.request_channel_revision($1,$2,$3,$4) id", args)).rows[0].id;
+    const requestedActivity = (await db.query("select * from content_agent.activity_log where request_id=$1 and detail->>'event'='channel_revision_requested'", [req])).rows;
+    check(requestedActivity.length === 1 && requestedActivity[0].actor_id === actor && requestedActivity[0].message === "Newsletter revision requested." && requestedActivity[0].detail.approval_id, "Revision request records the channel, actor and original note reference in Activity");
     const queues = (await db.query("select channel,status from content_agent.publish_queue where request_id=$1", [req])).rows;
     check(queues.find(q => q.channel === "newsletter").status === "cancelled" && queues.find(q => q.channel === "linkedin").status === "held", "Only the revised channel's pending send is withdrawn");
     await reject("select public.request_channel_revision($1,$2,$3,$4)", args, "Repeated submission cannot start a second revision");
@@ -48,6 +52,13 @@ async function main() {
     const saved = (await db.query("select * from public.save_channel_revision($1,$2,$3,$4)", saveArgs)).rows[0];
     const repeated = (await db.query("select * from public.save_channel_revision($1,$2,$3,$4)", saveArgs)).rows[0];
     check(saved.id === repeated.id && saved.version === 2 && saved.status === "draft" && saved.article_version_id === article && saved.parent_output_id === newsletter, "Retry saves exactly one unapproved version against the same article");
+    const completedActivity = (await db.query("select * from content_agent.activity_log where request_id=$1 and detail->>'event'='channel_revision_completed'", [req])).rows;
+    check(completedActivity.length === 1 && completedActivity[0].message === "Newsletter revision saved as version 2. Ready for fresh approval." && completedActivity[0].detail.output_id === saved.id, "Worker retries create exactly one revision completion entry with the version");
+    await db.query("delete from content_agent.activity_log where request_id=$1 and detail->>'event' like 'channel_revision_%'", [req]);
+    await db.query(activityMigration);
+    await db.query(activityMigration);
+    const restored = (await db.query("select * from content_agent.activity_log where request_id=$1 and detail->>'event' like 'channel_revision_%'", [req])).rows;
+    check(restored.length === 2 && restored.find(e => e.detail.event === "channel_revision_completed").created_at.getTime() === saved.created_at.getTime(), "Backfill restores existing revisions with original timestamps without duplicates");
     check((await db.query("select count(*)::int n from content_agent.article_versions where request_id=$1", [req])).rows[0].n === 1, "The article was not rewritten");
     check((await db.query("select count(*)::int n from content_agent.channel_outputs where request_id=$1 and channel='linkedin' and status='approved'", [req])).rows[0].n === 1, "Other channel copy and approval are preserved");
     await db.query("update content_agent.publish_queue set status='posted_manually',platform_url='https://example.test/post' where channel_output_id=$1", [linkedin]);
@@ -61,8 +72,12 @@ async function main() {
     check(claimed?.channel_output_id === saved.id && claimed.attempt === 1 && claimed.status === "publishing", "Delivery can claim the freshly approved revision exactly once");
     await db.query("update content_agent.publish_queue set status='published',platform_post_id='test-only-receipt' where channel_output_id=$1", [saved.id]);
     await db.query("select public.settle_content_request($1)", [req]);
-    await db.query("select public.request_channel_revision($1,$2,$3,$4)", [req, saved.id, actor, "Shorten the opening"]);
+    const secondJob = (await db.query("select public.request_channel_revision($1,$2,$3,$4) id", [req, saved.id, actor, "Shorten the opening"])).rows[0].id;
     check((await db.query("select status from content_agent.publish_queue where channel_output_id=$1", [saved.id])).rows[0].status === "published", "Revising published copy preserves the historical delivery");
+    await db.query("select * from public.claim_request_lease($1,'revision-test',75)", [req]);
+    const formatFailed = (await db.query("select * from public.save_channel_revision($1,$2,$3,$4)", [req, secondJob, "revision-test", { ...payload, status: "format_failed", format_check: { passed: false, checks: [] } }])).rows[0];
+    const warning = (await db.query("select * from content_agent.activity_log where request_id=$1 and detail->>'output_id'=$2 and detail->>'event'='channel_revision_completed'", [req, formatFailed.id])).rows[0];
+    check(warning.level === "warn" && warning.message.includes("Format checks need attention before approval."), "A revision with failed format checks records an honest warning");
     const permissions = (await db.query("select has_function_privilege('anon','public.request_channel_revision(uuid,uuid,uuid,text)','execute') anon,has_function_privilege('authenticated','public.save_channel_revision(uuid,uuid,text,jsonb)','execute') authenticated")).rows[0];
     check(!permissions.anon && !permissions.authenticated, "Revision mutations are service-role only");
     console.log(`${checks} channel revision checks passed; all changes rolled back.`);

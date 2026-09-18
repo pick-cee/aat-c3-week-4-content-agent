@@ -11,6 +11,7 @@ import { GateOne } from "@/components/gate-one";
 import { GateTwo } from "@/components/gate-two";
 import { FailurePanel } from "@/components/failure-panel";
 import { ActivityFeed } from "@/components/activity-feed";
+import { redact } from "@/lib/log";
 import { DeleteRequest } from "@/components/delete-request";
 import type {
   ActivityLogEntry,
@@ -55,7 +56,7 @@ export default async function RequestPage({
   if (requestError) throw new Error("Could not load this request. Please refresh.");
   if (!request) notFound();
 
-  const [sources, angles, versions, outputs, images, activity] = await Promise.all([
+  const [sources, angles, versions, outputs, images, activity, revisionApprovals] = await Promise.all([
     db
       .from(table("sources"))
       .select("id, request_id, title, url, site_name, author, published_at, included, excluded_reason, relevance_score, fetch_status, fetch_error, origin, embed_failed, embed_retryable, markdown_chars, from_cache")
@@ -71,10 +72,24 @@ export default async function RequestPage({
       .eq("request_id", id)
       .order("created_at", { ascending: false })
       .limit(40),
+    db.from(table("approvals")).select("id, note").eq("request_id", id)
+      .eq("subject_type", "channel_output").eq("decision", "revision_requested"),
   ]);
 
-  const loadError = [sources, angles, versions, outputs, images, activity].find(result => result.error)?.error;
+  const loadError = [sources, angles, versions, outputs, images, activity, revisionApprovals].find(result => result.error)?.error;
   if (loadError) throw new Error("Could not load the saved workspace. Please refresh.");
+
+  const activityEntries = (activity.data ?? []) as unknown as ActivityLogEntry[];
+  const revisionNotes: Record<string, string> = {};
+  for (const entry of activityEntries) {
+    const event = entry.detail?.event;
+    const note = event === "channel_revision_requested"
+      ? revisionApprovals.data?.find(a => a.id === entry.detail?.approval_id)?.note
+      : event === "channel_revision_completed"
+        ? outputs.data?.find(o => o.id === entry.detail?.output_id)?.revision_note
+        : null;
+    if (note) revisionNotes[entry.id] = redact(note);
+  }
 
   const versionList = (versions.data ?? []) as unknown as ArticleVersion[];
   const latest = versionList[0] ?? null;
@@ -176,7 +191,7 @@ export default async function RequestPage({
         </div>
       )}
 
-      <details className="activity-details"><summary>Activity & request details</summary><p className="small muted">Original brief: {request.idea}</p><ActivityFeed entries={(activity.data ?? []) as unknown as ActivityLogEntry[]} /><div className="mt-2"><DeleteRequest requestId={request.id} /></div></details>
+      <details className="activity-details"><summary>Activity & request details</summary><p className="small muted">Original brief: {request.idea}</p><ActivityFeed entries={activityEntries} revisionNotes={revisionNotes} /><div className="mt-2"><DeleteRequest requestId={request.id} /></div></details>
     </>
   );
 }

@@ -10,6 +10,8 @@ Approved copy can be revised too. Its pending queue item is cancelled atomically
 
 The result is a new, unapproved channel version against the same article version, with the previous output and revision note recorded. Failed format checks stay visible and still require an explicit override note on approval. A completed sibling cannot mark the request finished while a revised channel needs review. An already approved public article remains accessible during channel revision.
 
-Migration: `0031_channel_revisions.sql`. Apply with `npm run db:push`, or restart with the existing `AUTO_MIGRATE=true` setting. No additional environment variables are required.
+Activity records the revision request and saved version, with the channel name and your note shown beneath each entry. Format failures appear as warnings. Entries commit with the revision and worker retries do not duplicate them. Existing revisions are backfilled using their original timestamps. Notes are redacted for display and are not copied into diagnostic logs.
+
+Migrations: `0031_channel_revisions.sql` and `0032_channel_revision_activity.sql`. Apply with `npm run db:push`, or restart with the existing `AUTO_MIGRATE=true` setting. No additional environment variables are required.
 
 Verification: `npm test`, `npm run typecheck`, and `npx tsx scripts/verify-channel-revisions.ts`. The database script rolls back all fixture changes and does not call AI or send email.
